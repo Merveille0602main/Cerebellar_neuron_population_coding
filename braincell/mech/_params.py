@@ -1,0 +1,297 @@
+# Copyright 2026 BrainX Ecosystem Limited. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""Frozen parameter mapping for :mod:`braincell.mech`.
+
+:class:`Params` is an immutable, hashable, dict-like mapping used to
+store the declared parameters of a mechanism (e.g. ``g_max``, ``E`` for
+a leak channel). Its two load-bearing properties are:
+
+1. **Order-preserving iteration** so reprs, runtime constructor kwargs,
+   and layout-signature tuples are stable across runs.
+2. **Order-insensitive equality and hashing** so two declarations that
+   differ only in keyword order (``Channel("IL", g_max=g, E=e)`` vs
+   ``Channel("IL", E=e, g_max=g)``) deduplicate correctly in paint
+   grouping.
+
+:class:`Params` implements :class:`collections.abc.Mapping`, so
+``dict(params)`` and ``**params`` unpacking both work.
+"""
+
+from collections.abc import Iterator, Mapping
+from dataclasses import fields, is_dataclass
+from typing import Any
+
+import brainunit as u
+import numpy as np
+
+__all__ = ["Params", "quantity_hashable"]
+
+
+def _to_hashable(value: object) -> object:
+    """Convert ``value`` into a deterministic, hashable equivalent.
+
+    Used by :class:`Params` (and the runtime layout-dedup signatures)
+    because :class:`brainunit.Quantity` is not hashable on recent
+    ``saiunit`` releases (``Quantity.__hash__`` is set to ``None``).
+    Unwrap Quantity values into ``(payload, unit_str)`` tuples and
+    recurse through tuples, lists, dicts and dataclasses so that
+    equally-valued inputs still produce identical keys.
+
+    Concrete arrays are normalized by dtype, shape, and values so mechanism
+    declarations can carry heterogeneous parameters while remaining usable in
+    declaration cache keys.
+    """
+    if isinstance(value, u.Quantity):
+        mantissa = value.mantissa
+        if hasattr(mantissa, "shape") and getattr(mantissa, "shape", ()) != ():
+            try:
+                payload = tuple(np.asarray(mantissa).reshape(-1).tolist())
+            except Exception:
+                payload = id(mantissa)
+        else:
+            payload = float(np.asarray(mantissa))
+        return ("__Q__", payload, str(value.unit))
+    if isinstance(value, tuple):
+        return tuple(_to_hashable(v) for v in value)
+    if isinstance(value, list):
+        return ("__list__",) + tuple(_to_hashable(v) for v in value)
+    if isinstance(value, dict):
+        return ("__dict__",) + tuple((k, _to_hashable(v)) for k, v in sorted(value.items(), key=lambda kv: kv[0]))
+    # ``np.ndarray`` needs no branch of its own: ``np.asarray`` returns it
+    # unchanged and cannot raise, so the generic array branch below
+    # produces a byte-identical key for it.
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        try:
+            array = np.asarray(value)
+        except Exception:
+            return ("__opaque_array__", id(value))
+        return ("__array__", str(array.dtype), array.shape, tuple(array.reshape(-1).tolist()))
+    if is_dataclass(value) and not isinstance(value, type):
+        return (
+            type(value).__qualname__,
+            tuple(_to_hashable(getattr(value, f.name)) for f in fields(value)),
+        )
+    return value
+
+
+def _quantity_aware_hash(self: object) -> int:
+    return hash(_to_hashable(self))
+
+
+def quantity_hashable(cls: type) -> type:
+    """Class decorator: install a ``__hash__`` that handles Quantity fields.
+
+    Stack **after** ``@dataclass(frozen=True)``. Replaces the auto-generated
+    ``__hash__`` (which calls ``hash(self.field_tuple)`` and so trips on
+    unhashable :class:`brainunit.Quantity` fields) with one that routes
+    through :func:`_to_hashable`. Equal-valued instances continue to hash
+    equal; structural equality (``__eq__``) is left untouched.
+
+    Use on every frozen dataclass that may carry Quantity fields directly,
+    or that contains other dataclasses which do.
+    """
+    cls.__hash__ = _quantity_aware_hash  # type: ignore[assignment]
+    return cls
+
+
+class Params(Mapping[str, Any]):
+    """Frozen, hashable, order-preserving mechanism parameter mapping.
+
+    Parameters
+    ----------
+    data : Mapping, iterable of (name, value), or None
+        Initial key-value pairs. When ``None`` (the default), the
+        mapping starts empty.
+    **kwargs
+        Additional parameters provided as keyword arguments. These
+        override entries of the same name in ``data``.
+
+    Notes
+    -----
+    - Iteration order matches declaration order: entries in ``data``
+      come first (in their original order), followed by entries in
+      ``kwargs`` (in the order they were passed).
+    - Equality is dict-like — two instances with the same key-value
+      pairs compare equal regardless of iteration order.
+    - Hashing is consistent with equality: instances that compare
+      equal share the same hash, so ``Params`` is safe to use as a
+      dict key or set element.
+
+    Examples
+    --------
+
+    .. code-block:: python
+
+        >>> import brainunit as u
+        >>> from braincell.mech import Params
+        >>> p = Params(g_max=0.1 * u.mS / u.cm ** 2, E=-70 * u.mV)
+        >>> p["g_max"]
+        0.1 * mS / cm ** 2
+        >>> list(p)
+        ['g_max', 'E']
+        >>> p == Params(E=-70 * u.mV, g_max=0.1 * u.mS / u.cm ** 2)
+        True
+    """
+
+    __slots__ = ("_items", "_hashable", "_hash")
+
+    def __init__(self, data: object = None, /, **kwargs: Any) -> None:
+        merged: dict[str, Any] = {}
+        if data is None:
+            pass
+        elif isinstance(data, Params):
+            merged.update(data._items)
+        elif isinstance(data, Mapping):
+            for key, value in data.items():
+                merged[str(key)] = value
+        else:
+            # Interpret as an iterable of (name, value) pairs.
+            try:
+                iterator = iter(data)  # type: ignore[arg-type]
+            except TypeError as exc:
+                raise TypeError(
+                    f"Params() expected a Mapping or iterable of (name, value) pairs, got {type(data).__name__!r}."
+                ) from exc
+            for pair in iterator:
+                try:
+                    key, value = pair
+                except (TypeError, ValueError) as exc:
+                    raise TypeError(f"Params() entries must be (name, value) pairs, got {pair!r}.") from exc
+                merged[str(key)] = value
+        for key, value in kwargs.items():
+            merged[str(key)] = value
+        # The converted view is needed here anyway to validate that every
+        # value is hashable, so keep it rather than recomputing the same
+        # walk on every ``__hash__`` and ``__eq__`` for the lifetime of
+        # this (immutable) mapping.
+        hashable: dict[str, Any] = {}
+        for key, value in merged.items():
+            converted = _to_hashable(value)
+            try:
+                hash(converted)
+            except TypeError as exc:
+                raise TypeError(
+                    f"Params value for {key!r} must be hashable or a concrete array; got {type(value).__name__!r}."
+                ) from exc
+            hashable[key] = converted
+        object.__setattr__(self, "_items", merged)
+        object.__setattr__(self, "_hashable", hashable)
+        object.__setattr__(self, "_hash", hash(frozenset(hashable.items())))
+
+    # ------------------------------------------------------------------
+    # Mapping protocol
+    # ------------------------------------------------------------------
+
+    # ``keys``/``values``/``items``/``get``/``__contains__`` are supplied
+    # by the ``Mapping`` ABC on top of the three methods below.
+
+    def __getitem__(self, key: str) -> Any:
+        return self._items[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    # ------------------------------------------------------------------
+    # immutability: block accidental mutation
+    # ------------------------------------------------------------------
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(f"Params is immutable; cannot set attribute {name!r}.")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"Params is immutable; cannot delete attribute {name!r}.")
+
+    # ------------------------------------------------------------------
+    # equality / hashing: order-insensitive (dict-like)
+    # ------------------------------------------------------------------
+
+    def __eq__(self, other: object) -> bool:
+        # ``Params`` is a ``Mapping``, so the two former branches (one
+        # reaching into ``other._items``, one calling ``other.items()``)
+        # were the same comparison written twice.
+        if isinstance(other, Params):
+            return self._hashable == other._hashable
+        if isinstance(other, Mapping):
+            return len(self._items) == len(other) and self._hashable == {
+                key: _to_hashable(value) for key, value in other.items()
+            }
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        # ``__init__`` rejects unhashable values, so this cannot fail.
+        return self._hash
+
+    # ------------------------------------------------------------------
+    # repr: stable declared order
+    # ------------------------------------------------------------------
+
+    def __repr__(self) -> str:
+        if not self._items:
+            return "Params()"
+        parts = ", ".join(f"{k}={v!r}" for k, v in self._items.items())
+        return f"Params({parts})"
+
+    # ------------------------------------------------------------------
+    # structural updates (non-mutating)
+    # ------------------------------------------------------------------
+
+    def with_updates(self, **kwargs: Any) -> "Params":
+        """Return a copy with ``kwargs`` merged in.
+
+        Parameters
+        ----------
+        **kwargs
+            Parameters to add or replace. Keys already present in
+            ``self`` keep their original position in iteration order;
+            new keys are appended at the end.
+
+        Returns
+        -------
+        Params
+            A new :class:`Params` instance. ``self`` is unchanged.
+        """
+        merged = dict(self._items)
+        for key, value in kwargs.items():
+            merged[str(key)] = value
+        return Params(merged)
+
+    # ------------------------------------------------------------------
+    # construction
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def coerce(cls, value: object) -> "Params":
+        """Convert ``value`` to a :class:`Params` instance.
+
+        Parameters
+        ----------
+        value : Params, Mapping, iterable of (name, value), or None
+            Source data.
+
+        Returns
+        -------
+        Params
+            If ``value`` is already a :class:`Params`, it is returned
+            unchanged. Otherwise, a new instance is constructed.
+        """
+        if isinstance(value, Params):
+            return value
+        if value is None:
+            return cls()
+        return cls(value)

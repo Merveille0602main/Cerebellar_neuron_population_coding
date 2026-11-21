@@ -1,0 +1,155 @@
+# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
+# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
+
+name: Continuous Integration
+
+on:
+  push:
+    branches:
+      - '**'        # matches every branch
+
+
+permissions:
+  contents: read  # to fetch code
+  actions: write  # to cancel previous workflows
+
+
+# This is what will cancel the workflow
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+
+jobs:
+  # Exercise the packaging path on every push. Publish.yml only builds on a
+  # release, so before this job existed a packaging regression stayed invisible
+  # until the day a release was cut -- which is how every release so far broke.
+  # See docs/specs/2026-08-13-release-publish-ci-fix.md.
+  build_package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.13" ]
+
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.13.1
+        with:
+          access_token: ${{ github.token }}
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+      - name: Build package
+        run: python -m build
+      - name: Check distribution metadata
+        run: python -m twine check --strict dist/*
+      - name: Report distribution sizes
+        # An sdist that suddenly balloons means a build dependency re-enabled
+        # VCS file discovery and swept examples/ and docs/ back in.
+        run: ls -lh dist/
+      - name: Install the built wheel and import braincell
+        # Import from outside the checkout: the repository root contains a
+        # braincell/ source directory that would otherwise shadow the wheel.
+        run: |
+          python -m pip install dist/*.whl
+          cd "${RUNNER_TEMP}"
+          python -c "import braincell; print(braincell.__file__, braincell.__version__)"
+
+  test_linux_neuron_compare_cable:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.13" ]
+
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.13.1
+        with:
+          access_token: ${{ github.token }}
+      - uses: actions/checkout@v7
+      - name: Print concurrency group
+        run: echo '${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}'
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip cache purge
+          python -m pip install --upgrade pip setuptools --no-cache-dir
+          python -m pip install -r requirements-dev.txt --no-cache-dir
+          python -m pip install neuron --no-cache-dir
+          python -m pip install pandas --no-cache-dir
+          pip install . --no-cache-dir
+      - name: Test Linux-only cable neuron_compare suite
+        run: |
+          pytest examples/neuron_compare/cable/tests
+
+  test_macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.13" ]
+
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.13.1
+        with:
+          access_token: ${{ github.token }}
+      - uses: actions/checkout@v7
+      - name: Print concurrency group
+        run: echo '${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}'
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip cache purge
+          python -m pip install --upgrade pip setuptools --no-cache-dir
+          python -m pip install -r requirements-dev.txt  --no-cache-dir
+          pip install .
+      - name: Test with pytest
+        run: |
+          pytest braincell/
+
+
+  test_windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.13" ]
+
+    steps:
+      - name: Cancel Previous Runs
+        uses: styfle/cancel-workflow-action@0.13.1
+        with:
+          access_token: ${{ github.token }}
+      - uses: actions/checkout@v7
+      - name: Print concurrency group
+        run: echo '${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}'
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip cache purge
+          python -m pip install --upgrade pip setuptools --no-cache-dir
+          python -m pip install -r requirements-dev.txt  --no-cache-dir
+          pip install .  --no-cache-dir
+      - name: Test with pytest
+        run: |
+          pytest braincell/ -p no:faulthandler

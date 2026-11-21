@@ -1,0 +1,16 @@
+{
+  "meta": {
+    "label": "Stellate cell cable sweeps"
+  },
+  "defaults": {
+    "morphology": {
+      "path": "../../Cerebellum_mod/SC/morphology/SC.asc"
+    }
+  },
+  "templates": [
+    "../templates/ac.json",
+    "../templates/dc.json",
+    "../templates/vinit.json",
+    "../templates/cv.json"
+  ]
+}

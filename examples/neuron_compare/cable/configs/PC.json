@@ -1,0 +1,16 @@
+{
+  "meta": {
+    "label": "Purkinje cell cable sweeps"
+  },
+  "defaults": {
+    "morphology": {
+      "path": "../../Cerebellum_mod/PC/morphology/PC.asc"
+    }
+  },
+  "templates": [
+    "../templates/ac.json",
+    "../templates/dc.json",
+    "../templates/vinit.json",
+    "../templates/cv.json"
+  ]
+}

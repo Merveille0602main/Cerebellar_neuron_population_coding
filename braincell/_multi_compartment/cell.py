@@ -1,0 +1,3168 @@
+# Copyright 2026 BrainX Ecosystem Limited. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""``Cell`` — single-class multi-compartment neuron.
+
+The population-view contract is specified in
+``docs/specs/2026-08-20-cell-population-view.md``.
+
+A ``Cell`` carries both the declaration (morphology, CV policy, paint /
+place rules, solver, spike config) and the runtime (``V`` / ``spike`` /
+``current_time`` brainstate states, node tree, axial operator,
+installed channel / ion nodes).
+
+The lifecycle has two phases:
+
+1. **DECLARING** (default). ``paint`` / ``place`` / ``cv_policy`` /
+   ``V_th`` / ``V_init`` / ``solver`` / ``spk_fun`` setters are all
+   mutable. Runtime methods raise.
+2. **INITIALIZED**. After :meth:`init_state`, mutation is frozen and
+   the runtime surface (:meth:`run`, :meth:`update`,
+   :meth:`sample_probe`, inspection, ...) becomes available. Call
+   :meth:`reset` to drop the runtime and re-enter DECLARING.
+
+``run(dt=, duration=)`` auto-calls :meth:`init_state` on first use for
+convenience. Subsequent ``run`` calls never re-initialize.
+"""
+
+import operator
+import warnings
+import weakref
+from types import MappingProxyType
+from typing import Callable, ClassVar, Mapping, Optional
+from dataclasses import dataclass
+
+import brainstate
+import braintools
+import brainunit as u
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from braincell._base_channel import Channel, IonChannel, Synapse as RuntimeSynapse
+from braincell._base_ion import Ion, MixIons
+from braincell._base_neuron import HHTypedNeuron, _zero_spike_like
+from braincell._misc import (
+    is_traced_value,
+    scalar_decimal,
+    profiler_call_name as _call_name,
+    profiler_scope_name as _scope_name,
+)
+from braincell._typing import Initializer, Size
+from braincell._compute.table import MechanismObjectTable, build_mechanism_object_table
+from braincell._compute.scheduling import build_node_scheduling
+from braincell._compute.state import CellRuntimeState
+from braincell._compute.bindings import _is_root_level_runtime_node
+from braincell._compute.layouts import layout_id_from_key
+from braincell._discretization.mechanism import (
+    PaintRule,
+    PlaceRule,
+    default_paint_rules,
+    merge_paint_rules,
+    merge_place_rules,
+    normalize_paint_rules,
+    normalize_place_rule,
+)
+from braincell._discretization.policy import CVPerBranch, CVPolicy
+from braincell._discretization.base import (
+    CV,
+    CVTree,
+    Discretization,
+    Node,
+    NodeTree,
+    build_discretization,
+)
+from braincell.filter import LocsetBatch, LocsetExpr, LocsetMask, RegionExpr, RegionMask, at
+from braincell.network.event import EventOutputCollection, _CellSpikeSource
+from braincell.network.recording import RecordingSpec, compile_recording, recording_is_active
+from braincell.reduction import ReductionOutput, ReductionViewCollection
+from braincell.reduction.runtime import ReductionInputRuntime, build_reduction_input_runtime
+from braincell.morph.morphology import Morphology, clone_morpho
+from braincell.quad import get_integrator, ind_exp_euler_step
+from braincell.quad._exp_euler import _ind_exp_euler_step_selected
+from braincell.quad._staggered import build_cv_axial_operator
+from braincell.quad.protocol import DiffEqGroupState, IndependentIntegration, state_grouping
+from braincell.mech import CVContext, Synapse as SynapsePlacement
+from . import currents, field_resolution, probes, run as run_module
+from braincell._compute import bridge
+from .synapses import SynapseView, _SynapseStore, raise_on_name_type_conflict
+from .clamps import ClampView, _ClampStore
+from .selection import BranchSelector, CVSelector, _CellScope
+from .density_views import ChannelView, IonView
+
+__all__ = ["Cell", "CellView", "MultiCompartment"]
+
+
+@dataclass(frozen=True)
+class AxialOperatorCache:
+    float_dtype: jnp.dtype
+    operator: object
+
+
+@dataclass(frozen=True)
+class RuntimeIonBinding:
+    """One runtime ion seen through a CV or node inspection view."""
+
+    name: str
+    runtime: object
+    cell: "Cell"
+    cv_ids: tuple[int, ...] = ()
+    point_ids: tuple[int, ...] = ()
+
+    def get(self, field: str):
+        """Return one field projected into the local CV or node view."""
+        if not hasattr(self.runtime, field):
+            raise AttributeError(f"Runtime ion {self.name!r} has no field {field!r}.")
+        raw = getattr(self.runtime, field)
+        if self.cv_ids:
+            values = field_resolution.coerce_named_cv_values(self.cell, raw, caller="Runtime CV inspection")
+            return _select_local_values(values, ids=self.cv_ids)
+        if self.point_ids:
+            values = field_resolution.coerce_runtime_point_values(self.cell, raw)
+            return _select_local_values(values, ids=self.point_ids)
+        return raw
+
+    def __getattr__(self, field: str):
+        if field.startswith("_"):
+            raise AttributeError(field)
+        return self.get(field)
+
+
+@dataclass(frozen=True)
+class RuntimeCVView:
+    """Readonly runtime inspection view anchored at one static CV."""
+
+    id: int
+    declaration: CV
+    layout_ids: tuple[int, ...]
+    mid_node_id: int
+    ions: Mapping[str, RuntimeIonBinding]
+
+
+@dataclass(frozen=True)
+class RuntimeNodeView:
+    """Readonly runtime inspection view anchored at one static node."""
+
+    id: int
+    declaration: Node
+    layout_ids: tuple[int, ...]
+    source_cv_ids: tuple[int, ...]
+    ions: Mapping[str, RuntimeIonBinding]
+
+
+class _CellFacade:
+    """Share population-selection behavior without owning model data."""
+
+    @property
+    def _view_root(self) -> "Cell":
+        raise NotImplementedError
+
+    @property
+    def root(self) -> "Cell":
+        """Return the root Cell that owns this view."""
+        return self._view_root
+
+    @property
+    def _scope(self) -> _CellScope:
+        return self._view_root._root_scope()
+
+    def _with_scope(self, scope: _CellScope) -> "CellView":
+        return CellView(self._view_root, scope.population_indices, scope=scope)
+
+    def __getitem__(self, selection) -> "CellView":
+        """Return a view selected relative to this cell-like object."""
+        return self._with_scope(self._scope.select_population(selection))
+
+    def on(self, region: RegionExpr | RegionMask) -> "CellView":
+        """Select CVs with positive area coverage by a continuous region."""
+        return self._with_scope(self._scope.select_region(self._view_root, region))
+
+    def loc(self, locset: LocsetExpr | LocsetMask | LocsetBatch) -> "CellView":
+        """Select the owning CVs of ordered continuous locations."""
+        return self._with_scope(self._scope.select_locations(self._view_root, locset))
+
+    @property
+    def branch(self) -> BranchSelector:
+        """Return a morphology-branch selector for this scope."""
+        return BranchSelector(self)
+
+    @property
+    def cv(self) -> CVSelector:
+        """Return a control-volume selector for this scope."""
+        return CVSelector(self)
+
+    @property
+    def soma(self) -> "CellView":
+        """Select branches whose morphology type is ``soma``."""
+        return self.branch.by_type("soma")
+
+    @property
+    def axon(self) -> "CellView":
+        """Select branches whose morphology type is ``axon``."""
+        return self.branch.by_type("axon")
+
+    @property
+    def dendrite(self) -> "CellView":
+        """Select branches whose morphology type is ``dendrite``."""
+        return self.branch.by_type("dendrite")
+
+    @property
+    def basal_dendrite(self) -> "CellView":
+        """Select branches whose morphology type is ``basal_dendrite``."""
+        return self.branch.by_type("basal_dendrite")
+
+    @property
+    def apical_dendrite(self) -> "CellView":
+        """Select branches whose morphology type is ``apical_dendrite``."""
+        return self.branch.by_type("apical_dendrite")
+
+    @property
+    def channels(self) -> ChannelView:
+        """Return Channel logical owners intersecting this scope."""
+        return ChannelView(self._view_root, self._scope)
+
+    @property
+    def ions(self) -> IonView:
+        """Return Ion logical owners intersecting this scope."""
+        return IonView(self._view_root, self._scope)
+
+    def record(
+        self,
+        name: str,
+        observable,
+        *,
+        period=None,
+        frequency=None,
+        start=0.0 * u.ms,
+    ) -> RecordingSpec:
+        """Register an observer over this population/spatial scope.
+
+        Parameters
+        ----------
+        name : str
+            Cell-local recording name.
+        observable : object
+            Descriptor created by :mod:`braincell.observe`.
+        period, frequency : Quantity, optional
+            Mutually exclusive regular sampling interval declarations.
+        start : Quantity, optional
+            Global schedule start. Defaults to ``0 ms``.
+
+        Returns
+        -------
+        RecordingSpec
+            Frozen declaration owned by the root Cell.
+        """
+        return self._view_root._add_recording(
+            RecordingSpec(
+                name=name,
+                scope=self._scope,
+                observable=observable,
+                period=period,
+                frequency=frequency,
+                start=start,
+            )
+        )
+
+
+class PopulationRuntimeView:
+    """Provide read-only population selection over one runtime object."""
+
+    __slots__ = ("_runtime", "_population_indices", "_population_size", "_packed_population_index")
+
+    def __init__(
+        self,
+        runtime,
+        population_indices: tuple[int, ...],
+        population_size: int,
+        *,
+        packed_population_index: np.ndarray | None = None,
+    ) -> None:
+        self._runtime = runtime
+        self._population_indices = population_indices
+        self._population_size = population_size
+        self._packed_population_index = packed_population_index
+
+    @property
+    def root(self):
+        """Return the unselected runtime object."""
+        return self._runtime
+
+    @property
+    def population_indices(self) -> tuple[int, ...]:
+        """Return selected population indices."""
+        return self._population_indices
+
+    def get(self, field: str):
+        """Return one runtime field gathered over the selected population."""
+        if not hasattr(self._runtime, field):
+            raise AttributeError(f"Runtime object {type(self._runtime).__name__!r} has no field {field!r}.")
+        value = getattr(self._runtime, field)
+        if callable(value) or isinstance(value, (dict, list, set)):
+            raise AttributeError(f"Runtime field {field!r} is not available through the read-only population view.")
+        if isinstance(value, brainstate.State):
+            value = value.value
+        if self._packed_population_index is not None:
+            return _select_packed_population_value(
+                value,
+                owners=self._packed_population_index,
+                population_indices=self._population_indices,
+            )
+        return _select_population_value(
+            value,
+            population_indices=self._population_indices,
+            population_size=self._population_size,
+        )
+
+    def __getattr__(self, field: str):
+        if field.startswith("_"):
+            raise AttributeError(field)
+        return self.get(field)
+
+
+class CellView(_CellFacade):
+    """View selected members of a homogeneous :class:`Cell` population.
+
+    A view owns no morphology, discretization, or runtime state. It stores a
+    root cell reference and stable population indices, then gathers selected
+    values on demand.
+
+    Parameters
+    ----------
+    cell : Cell
+        Root population cell.
+    population_indices : tuple of int
+        Stable root-population indices.
+    """
+
+    __slots__ = ("_cell", "_population_indices", "_selection_scope")
+
+    def __init__(
+        self,
+        cell: "Cell",
+        population_indices: tuple[int, ...],
+        *,
+        scope: _CellScope | None = None,
+    ) -> None:
+        self._cell = cell
+        self._population_indices = tuple(population_indices)
+        self._selection_scope = (
+            cell._root_scope().select_population(tuple(population_indices)) if scope is None else scope
+        )
+
+    @property
+    def root(self) -> "Cell":
+        """Return the root :class:`Cell` that owns all data."""
+        return self._cell
+
+    @property
+    def cell(self) -> "Cell":
+        """Return the root cell (compatibility spelling)."""
+        return self._cell
+
+    @property
+    def population_indices(self) -> tuple[int, ...]:
+        """Return selected root-population indices."""
+        return self._population_indices
+
+    @property
+    def _view_root(self) -> "Cell":
+        return self._cell
+
+    @property
+    def _scope(self) -> _CellScope:
+        return self._selection_scope
+
+    def _with_scope(self, scope: _CellScope) -> "CellView":
+        return CellView(self._cell, scope.population_indices, scope=scope)
+
+    @property
+    def indices(self) -> np.ndarray:
+        """Return selected root-population indices as an integer array."""
+        return np.asarray(self._population_indices, dtype=np.int64)
+
+    @property
+    def shape(self) -> tuple[int]:
+        """Return the one-dimensional selection shape."""
+        return (len(self),)
+
+    @property
+    def size(self) -> int:
+        """Return the number of selected population members."""
+        return len(self)
+
+    @property
+    def pop_size(self) -> tuple[int]:
+        """Return the selected population shape."""
+        return self.shape
+
+    @property
+    def varshape(self) -> tuple[int, int]:
+        """Return selected population-by-CV shape."""
+        if not self._scope.spatially_restricted:
+            return self.shape + (self._cell.n_cv,)
+        return (len(self._scope.pairs),)
+
+    def __len__(self) -> int:
+        return len(self._population_indices)
+
+    @property
+    def morpho(self) -> Morphology:
+        """Return the shared root morphology without copying it."""
+        return self._cell.morpho
+
+    @property
+    def cv_policy(self) -> CVPolicy:
+        """Return the shared control-volume policy."""
+        return self._cell.cv_policy
+
+    @property
+    def paint_rules(self) -> tuple[PaintRule, ...]:
+        """Return population-wide paint declarations."""
+        return self._cell.paint_rules
+
+    @property
+    def place_rules(self) -> tuple[PlaceRule, ...]:
+        """Return place declarations that affect at least one selected cell."""
+        selected = set(self._population_indices)
+        if not selected:
+            return ()
+        return tuple(
+            rule
+            for rule in self._cell.place_rules
+            if rule.population_indices is None or selected.intersection(rule.population_indices)
+        )
+
+    @property
+    def solver(self):
+        """Return the shared voltage solver."""
+        return self._cell.solver
+
+    @property
+    def solver_name(self) -> str:
+        """Return the shared voltage solver name."""
+        return self._cell.solver_name
+
+    @property
+    def subsolver(self):
+        """Return the shared ion/channel subsolver."""
+        return self._cell.subsolver
+
+    @property
+    def subsolver_name(self) -> str:
+        """Return the shared ion/channel subsolver name."""
+        return self._cell.subsolver_name
+
+    @property
+    def substeps(self) -> int:
+        """Return the shared substep count."""
+        return self._cell.substeps
+
+    @property
+    def membrane_linearizer(self) -> str:
+        """Return the shared membrane linearizer name."""
+        return self._cell.membrane_linearizer
+
+    @property
+    def spk_fun(self):
+        """Return the shared spike function."""
+        return self._cell.spk_fun
+
+    @property
+    def name(self) -> str | None:
+        """Return the root cell name."""
+        return self._cell.name
+
+    @property
+    def n_cv(self) -> int:
+        """Return the shared number of control volumes."""
+        return self._cell.n_cv
+
+    @property
+    def cvs(self) -> tuple[CV, ...]:
+        """Return control-volume declarations selected by this scope."""
+        if not self._scope.spatially_restricted:
+            return self._cell.cvs
+        return tuple(self._cell.cvs[cv_id] for cv_id in self._scope.cv_ids)
+
+    @property
+    def cv_midpoints(self) -> LocsetMask:
+        """Return continuous midpoint locations for selected CVs."""
+        if not self._scope.spatially_restricted:
+            return self._cell.cv_midpoints
+        root = self._cell.cv_midpoints
+        ids = np.asarray(self._scope.cv_ids, dtype=np.int64)
+        return LocsetMask.from_columns(root.branch_id[ids], root.branch_x[ids])
+
+    @property
+    def spatial_pairs(self) -> np.ndarray:
+        """Return selected ``(population_index, cv_id)`` rows."""
+        return np.asarray(self._scope.pairs, dtype=np.int64).reshape(-1, 2)
+
+    @property
+    def locations(self):
+        """Return ordered, duplicate-preserving source location rows."""
+        return self._scope.locations
+
+    def at_x(self, branch_x: float) -> "CellView":
+        """Select one coordinate on an exactly selected morphology branch."""
+        branch_ids = self._scope.exact_branch_ids
+        if branch_ids is None or len(branch_ids) != 1:
+            raise ValueError("CellView.at_x(...) requires exactly one branch selected through cell.branch[...].")
+        return self.loc(at(int(branch_ids[0]), branch_x))
+
+    @property
+    def cv_tree(self) -> CVTree:
+        """Return the shared control-volume tree."""
+        return self._cell.cv_tree
+
+    @property
+    def node_tree(self) -> NodeTree:
+        """Return the shared electrical node tree."""
+        return self._cell.node_tree
+
+    @property
+    def cv_contexts(self) -> tuple[CVContext, ...]:
+        """Return shared control-volume contexts."""
+        return self._cell.cv_contexts
+
+    @property
+    def n_point(self) -> int:
+        """Return the runtime electrical point count."""
+        return self._cell.n_point
+
+    @property
+    def n_compartment(self) -> int:
+        """Return the shared compartment count."""
+        return self._cell.n_compartment
+
+    @property
+    def current_time(self):
+        """Return the root cell's shared simulation time."""
+        return self._cell.current_time
+
+    @property
+    def layouts(self):
+        """Return shared runtime layout metadata."""
+        return self._cell.layouts
+
+    @property
+    def voltage_shape(self):
+        """Return the selected population voltage shape."""
+        self._cell._raise_if_not_initialized("CellView.voltage_shape")
+        return self.varshape
+
+    @property
+    def point_placements(self):
+        """Return placement declarations effective for selected cells."""
+        selected = set(self._population_indices)
+        if not selected:
+            return ()
+        return tuple(
+            placement
+            for placement in self._cell.point_placements
+            if placement.population_index is None or int(placement.population_index) in selected
+        )
+
+    @property
+    def synapses(self):
+        """Return logical synapse instances owned by selected cells."""
+        selected = self._cell.synapses.for_population(self._population_indices)
+        if self._scope.spatially_restricted:
+            selected = selected.for_scope_pairs(self._scope.pairs)
+        return selected
+
+    @property
+    def clamps(self):
+        """Return logical current clamps owned by this population/spatial view."""
+        selected = self._cell.clamps.for_population(self._population_indices)
+        if self._scope.spatially_restricted:
+            selected = selected.for_scope_pairs(self._scope.pairs)
+        return selected
+
+    @property
+    def connections(self):
+        """Return routing rows whose destination synapses belong to selected cells."""
+        selected = self._cell.connections.for_population(self._population_indices)
+        if self._scope.spatially_restricted:
+            selected = selected.by_synapse_ids(self.synapses.id)
+        return selected
+
+    @property
+    def event_outputs(self) -> EventOutputCollection:
+        """Return named live event outputs for selected population members."""
+        return self._cell.event_outputs.for_population(self._population_indices)
+
+    @property
+    def reductions(self) -> ReductionViewCollection:
+        """Return registered reduction models over selected population members."""
+        if self._scope.spatially_restricted:
+            raise RuntimeError("Reduction parameters can only be selected by population, not by morphology location.")
+        return ReductionViewCollection(self._cell, self._population_indices)
+
+    @property
+    def outputs(self) -> Mapping[str, object]:
+        """Return initialized model outputs gathered over selected members."""
+        if self._scope.spatially_restricted:
+            raise RuntimeError("Model outputs can only be selected by population, not by morphology location.")
+        return self._cell._selected_outputs(self._population_indices)
+
+    @property
+    def V_init(self):
+        """Return effective initial voltages for selected cells."""
+        return self._cell._selected_population_parameter("V_init", self._population_indices)
+
+    @V_init.setter
+    def V_init(self, value) -> None:
+        self.set(V_init=value)
+
+    @property
+    def V_th(self):
+        """Return effective spike thresholds for selected cells."""
+        return self._cell._selected_population_parameter("V_th", self._population_indices)
+
+    @V_th.setter
+    def V_th(self, value) -> None:
+        self.set(V_th=value)
+
+    @property
+    def V(self):
+        """Return initialized membrane voltage gathered over selected cells."""
+        self._cell._raise_if_not_initialized("CellView.V")
+        if self._scope.spatially_restricted:
+            if len(self._cell.pop_size) == 0:
+                return self._cell.V.value[..., self._scope.pair_cv_id]
+            return self._cell.V.value[..., self._scope.pair_population_index, self._scope.pair_cv_id]
+        return _select_population_value(
+            self._cell.V.value,
+            population_indices=self._population_indices,
+            population_size=self._cell._population_size,
+        )
+
+    @property
+    def spike(self):
+        """Return initialized spike values gathered over selected cells."""
+        self._cell._raise_if_not_initialized("CellView.spike")
+        if self._cell._uses_reduction:
+            return _select_model_output(
+                self._cell.spike.value,
+                population_indices=self._population_indices,
+                population_size=self._cell._population_size,
+                batch_size=self._cell._runtime_batch_size,
+                detailed=False,
+            )
+        return _select_population_value(
+            self._cell.spike.value,
+            population_indices=self._population_indices,
+            population_size=self._cell._population_size,
+        )
+
+    def set(self, **parameters) -> "CellView":
+        """Set shape-preserving declaration parameters for selected cells.
+
+        Parameters
+        ----------
+        **parameters
+            Supported keys are ``V_init`` and ``V_th``. Values must be
+            concrete voltage quantities that broadcast within the selected
+            population-by-CV shape. Passing ``None`` for ``V_init`` removes
+            selected overrides and restores the root declaration.
+
+        Returns
+        -------
+        CellView
+            This view.
+        """
+        self._cell._set_selected_population_parameters(self._population_indices, parameters)
+        return self
+
+    def place(
+        self,
+        locset: LocsetExpr | LocsetMask | LocsetBatch,
+        *mechanisms,
+    ) -> "CellView":
+        """Place independent point instances on selected population members.
+
+        Parameters
+        ----------
+        locset : LocsetExpr, LocsetMask, LocsetBatch, or sequence
+            One shared locset, an aligned rectangular batch, or one possibly
+            ragged locset per selected population member.
+        *mechanisms : Point
+            Point declarations. Per-cell locset sequences currently accept
+            synapse declarations.
+
+        Returns
+        -------
+        CellView
+            This population view.
+        """
+        if self._scope.spatially_restricted:
+            raise RuntimeError(
+                "Spatial CellView.place() is not supported; pass the desired Locset to Cell.place() "
+                "or select population members only before place()."
+            )
+        self._cell._place_selected(self._population_indices, locset, mechanisms)
+        return self
+
+    def paint(self, region: RegionExpr, *mechanisms):
+        """Reject population-specific density painting in v1."""
+        raise NotImplementedError(
+            "CellView.paint() does not support population-specific density mechanisms; "
+            "use root Cell.paint() to paint the whole population."
+        )
+
+    def init_state(self, *args, **kwargs):
+        """Reject lifecycle transitions on a population view."""
+        raise RuntimeError("CellView cannot own runtime state; call init_state() on its root Cell.")
+
+    def reset(self, *args, **kwargs):
+        """Reject lifecycle transitions on a population view."""
+        raise RuntimeError("CellView cannot reset runtime state; call reset() on its root Cell.")
+
+    def reset_state(self, *args, **kwargs):
+        """Reject runtime mutation on a population view."""
+        raise RuntimeError("CellView runtime state is read-only; call reset_state() on its root Cell.")
+
+    def run(self, *args, **kwargs):
+        """Reject simulation execution on a population view."""
+        raise RuntimeError("CellView cannot run independently; call run() on its root Cell.")
+
+    def get_ion(self, name: str) -> PopulationRuntimeView:
+        """Return read-only selected-population inspection for one runtime ion."""
+        runtime = self._cell.get_ion(name)
+        return PopulationRuntimeView(runtime, self._population_indices, self._cell._population_size)
+
+    def get_runtime_node(self, layout_id: int) -> PopulationRuntimeView:
+        """Return read-only selected-population inspection for a runtime node."""
+        runtime = self._cell.get_runtime_node(layout_id)
+        layout = self._cell.layouts[int(layout_id)]
+        return PopulationRuntimeView(
+            runtime,
+            self._population_indices,
+            self._cell._population_size,
+            packed_population_index=layout.population_index,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"CellView(name={self.name!r}, population_indices={self._population_indices!r}, "
+            f"cv_ids={self._scope.cv_ids!r})"
+        )
+
+
+class Cell(_CellFacade, HHTypedNeuron):
+    """Multi-compartment cell with explicit declaration / initialization phases.
+
+    Parameters
+    ----------
+    morpho : Morphology
+        Morphology tree.
+    cv_policy : CVPolicy, optional
+        Control-volume splitting policy; defaults to :class:`CVPerBranch`.
+    V_th : Quantity
+        Spike-detection threshold (default ``0. mV``).
+    V_init : Quantity or Callable or None
+        Initial voltage. ``None`` means "use per-CV resting potential".
+    spk_fun : Callable
+        Surrogate-gradient spike function.
+    solver : str or Callable
+        Integrator name (registry lookup) or callable step function.
+    subsolver : str or Callable or None
+        Integrator for Markov channels and kinetic ions. Together with
+        ``substeps=None``, ``None`` selects ``"backward_euler"``.
+    substeps : int or None
+        Number of subsolver steps per main cell step. Together with
+        ``subsolver=None``, ``None`` selects one step.
+    ion_channel_update_order : {"family", "integration"}
+        Post-voltage ion/channel scheduling. ``"family"`` updates all ions
+        before all channels; ``"integration"`` preserves the previous
+        IndependentIntegration-grouped scheduling.
+    membrane_linearizer : {"point", "generic"}
+        Compatibility selector for the membrane-current linearization
+        strategy. Both values currently differentiate the assembled CV-space
+        membrane derivative; painted density mechanisms already live on the
+        CV axis, while sparse point contributions are gathered first.
+    name : str, optional
+        Cell name.
+    """
+
+    __module__ = "braincell"
+
+    # A Cell lays its DiffEqState leaves out per compartment, so a solver that
+    # flattens them must concatenate rather than stack. See DiffEqModule.
+    diffeq_state_merging: ClassVar[str] = "concat"
+
+    # ------------------------------------------------------------------
+    # Construction
+
+    def __init__(
+        self,
+        morpho: Morphology,
+        *,
+        pop_size: Size = 1,
+        cv_policy: CVPolicy | None = None,
+        V_th: u.Quantity = 0 * u.mV,
+        V_init: Optional[Initializer] = None,
+        spk_fun: Callable = braintools.surrogate.ReluGrad(),
+        solver: str | Callable = "staggered",
+        subsolver: str | Callable | None = None,
+        substeps: int | None = None,
+        cache_ion_total_current: bool = True,
+        ion_channel_update_order: str = "family",
+        membrane_linearizer: str = "point",
+        name: str | None = None,
+    ) -> None:
+        normalized_pop_size = _normalize_pop_size(pop_size)
+        HHTypedNeuron.__init__(self, size=normalized_pop_size + (1,), name=name)
+
+        if not isinstance(morpho, Morphology):
+            raise TypeError(f"Cell expects Morphology, got {type(morpho).__name__!s}.")
+
+        self._declaration_morpho = morpho
+        self._morpho = morpho
+        self._pop_size = normalized_pop_size
+
+        self._discretization_policy: CVPolicy = CVPerBranch() if cv_policy is None else cv_policy
+        if not isinstance(self._discretization_policy, CVPolicy):
+            raise TypeError(f"cv_policy must be CVPolicy, got {type(self._discretization_policy).__name__!s}.")
+
+        self._paint_rules: tuple[PaintRule, ...] = default_paint_rules()
+        self._place_rules: tuple[PlaceRule, ...] = ()
+
+        self._V_th = V_th
+        self._V_th_declaration = V_th
+        self._V_init = V_init
+        self._V_init_materialized = None
+        self._population_parameter_overrides: dict[str, dict[int, object]] = {
+            "V_init": {},
+            "V_th": {},
+        }
+        self._spk_fun = spk_fun
+        self._name = name
+        self._solver_name, self._solver_fn = _resolve_solver(solver)
+        (
+            self._subsolver_name,
+            self._subsolver_fn,
+            self._substeps,
+        ) = _resolve_subsolver_schedule(subsolver, substeps)
+        self.cache_ion_total_current = bool(cache_ion_total_current)
+        self.ion_channel_update_order = _validate_ion_channel_update_order(ion_channel_update_order)
+        self._membrane_linearizer = _validate_membrane_linearizer(membrane_linearizer)
+
+        self._discretization_cache: Discretization | None = None
+        self._discretization_cache_key: object = None
+        self._root_scope_cache: _CellScope | None = None
+
+        self._current_time_state = brainstate.ShortTermState(0.0 * u.ms)
+        self._node_scheduling_cache: dict[tuple[str, int], object] = {}
+        self._run_loop_cache: dict[tuple[object, ...], object] = {}
+
+        self._runtime: CellRuntimeState | None = None
+        self._reduction_models: dict[str, object] = {}
+        self._selected_model_name = "detailed"
+        self._reduction_input_runtime: ReductionInputRuntime | None = None
+        self._reduction_output_states: dict[str, brainstate.State] = {}
+        self._pending_reduction_inputs = None
+        self._runtime_batch_size: int | None = None
+        self._runtime_cvs_cache: tuple[RuntimeCVView, ...] | None = None
+        self._runtime_nodes_cache: tuple[RuntimeNodeView, ...] | None = None
+        self._synapse_store_cache: _SynapseStore | None = None
+        self._clamp_store_cache: _ClampStore | None = None
+        self._spike_event_source_cache: _CellSpikeSource | None = None
+        self._synapse_input_bindings: dict[str, list[tuple[object, object, object]]] = {}
+        self._synapse_parameter_overrides: dict[tuple[int, int, str], object] = {}
+        self._density_parameter_overrides: dict[tuple[str, str, int, int, str], object] = {}
+        self._synapse_origins: dict[int, SynapsePlacement] = {}
+        self._connection_store_cache = None
+        self._network_owner_ref: weakref.ReferenceType | None = None
+        self._recording_specs: dict[str, RecordingSpec] = {}
+        self._compiled_recording_cache: dict[tuple, tuple] = {}
+
+        self._initialized = False
+
+        from braincell.trainable import TrainableManager
+
+        self.trainables = TrainableManager(self)
+
+        # Eager policy validation via the preview.
+        _ = self.cvs
+
+    # ------------------------------------------------------------------
+    # Phase guards
+
+    def _raise_if_initialized(self, action: str) -> None:
+        owner = self.network_owner
+        if owner is not None and owner._initialized and not getattr(owner, "_cell_lifecycle_active", False):
+            owner_name = owner.name if owner.name is not None else "<unnamed>"
+            raise RuntimeError(f"Cannot {action} after owning Network {owner_name!r} has been initialized.")
+        if self._initialized:
+            raise RuntimeError(f"Cannot {action} after init_state(); call reset() first.")
+
+    def _raise_if_not_initialized(self, action: str) -> None:
+        if not self._initialized:
+            raise RuntimeError(f"{action} requires init_state() first.")
+
+    @property
+    def network_owner(self):
+        """Return the Network that owns execution of this cell, if any."""
+        return None if self._network_owner_ref is None else self._network_owner_ref()
+
+    def _bind_network_owner(self, network) -> None:
+        """Bind this cell to one Network execution scope."""
+        owner = self.network_owner
+        if owner is not None and owner is not network:
+            owner_name = owner.name if owner.name is not None else "<unnamed>"
+            raise RuntimeError(f"Cell already belongs to Network {owner_name!r}.")
+        self._network_owner_ref = weakref.ref(network)
+
+    def _raise_if_network_owned(self, action: str) -> None:
+        """Reject public lifecycle mutation outside the owning Network."""
+        owner = self.network_owner
+        if owner is None or getattr(owner, "_cell_lifecycle_active", False):
+            return
+        owner_name = owner.name if owner.name is not None else "<unnamed>"
+        raise RuntimeError(f"Cell belongs to Network {owner_name!r}; use Network.{action} instead.")
+
+    # ------------------------------------------------------------------
+    # Read-only accessors / guarded config setters
+
+    @property
+    def morpho(self) -> Morphology:
+        return self._morpho
+
+    @property
+    def cv_policy(self) -> CVPolicy:
+        return self._discretization_policy
+
+    @cv_policy.setter
+    def cv_policy(self, value: CVPolicy) -> None:
+        self._raise_if_initialized("assign cv_policy")
+        if not isinstance(value, CVPolicy):
+            raise TypeError(f"cv_policy must be CVPolicy, got {type(value).__name__!s}.")
+        self._discretization_policy = value
+        self._invalidate_discretization_cache()
+
+    @property
+    def paint_rules(self) -> tuple[PaintRule, ...]:
+        return self._paint_rules
+
+    @property
+    def place_rules(self) -> tuple[PlaceRule, ...]:
+        return self._place_rules
+
+    @property
+    def V_th(self):
+        return self._V_th
+
+    @V_th.setter
+    def V_th(self, value) -> None:
+        # ``install_cell_runtime`` overwrites V_th with a vectorised
+        # version during ``init_state``; that call is permitted because
+        # ``_initialized`` is still False at that point. After
+        # ``init_state`` completes, the guard rejects further assignment.
+        self._raise_if_initialized("assign V_th")
+        self._V_th = value
+        if hasattr(self, "_population_parameter_overrides"):
+            self._population_parameter_overrides["V_th"].clear()
+
+    @property
+    def V_init(self):
+        return self._V_init
+
+    @V_init.setter
+    def V_init(self, value) -> None:
+        self._raise_if_initialized("assign V_init")
+        self._V_init = value
+        self._V_init_materialized = None
+        if hasattr(self, "_population_parameter_overrides"):
+            self._population_parameter_overrides["V_init"].clear()
+
+    @property
+    def solver(self):
+        return self._solver_fn
+
+    @solver.setter
+    def solver(self, value) -> None:
+        self._raise_if_initialized("assign solver")
+        self._solver_name, self._solver_fn = _resolve_solver(value)
+
+    @property
+    def solver_name(self) -> str:
+        return self._solver_name
+
+    @property
+    def subsolver(self):
+        """Return the effective Markov/kinetic-ion integrator callable."""
+        return self._subsolver_fn
+
+    @property
+    def subsolver_name(self) -> str:
+        """Return the effective Markov/kinetic-ion integrator name."""
+        return self._subsolver_name
+
+    @property
+    def substeps(self) -> int:
+        """Return the effective Markov/kinetic-ion substep count."""
+        return self._substeps
+
+    @property
+    def membrane_linearizer(self) -> str:
+        return self._membrane_linearizer
+
+    @membrane_linearizer.setter
+    def membrane_linearizer(self, value: str) -> None:
+        self._raise_if_initialized("assign membrane_linearizer")
+        self._membrane_linearizer = _validate_membrane_linearizer(value)
+
+    @property
+    def spk_fun(self):
+        return self._spk_fun
+
+    @spk_fun.setter
+    def spk_fun(self, value) -> None:
+        self._raise_if_initialized("assign spk_fun")
+        self._spk_fun = value
+
+    @property
+    def name(self) -> str | None:
+        return self._name
+
+    # ------------------------------------------------------------------
+    # Declaration mutators
+
+    def _place_selected(self, population_indices, locset, mechanisms) -> None:
+        self._raise_if_initialized("place()")
+        if any(not isinstance(mechanism, SynapsePlacement) for mechanism in mechanisms):
+            raise TypeError("Cell population-specific place() currently supports Synapse point mechanisms only.")
+        self._validate_synapse_names(mechanisms)
+        normalized_indices = tuple(population_indices)
+        if _is_per_cell_locset_sequence(locset):
+            self._place_per_cell(normalized_indices, tuple(locset), mechanisms)
+            return
+        aligned = isinstance(locset, LocsetBatch)
+        if aligned and len(locset) != len(normalized_indices):
+            raise ValueError(
+                "LocsetBatch batch rows must match the selected population size, "
+                f"got {len(locset)!r} rows for {len(normalized_indices)!r} cells."
+            )
+        self._place_rules = merge_place_rules(
+            self._place_rules,
+            (
+                normalize_place_rule(
+                    locset,
+                    mechanisms,
+                    population_indices=normalized_indices,
+                    aligned=aligned,
+                ),
+            ),
+        )
+        self._invalidate_discretization_cache()
+
+    def _place_per_cell(self, population_indices, locsets, mechanisms) -> None:
+        """Append one independently sized locset row per selected cell."""
+        if len(locsets) != len(population_indices):
+            raise ValueError(
+                "Per-cell locset rows must match the selected population size, "
+                f"got {len(locsets)!r} rows for {len(population_indices)!r} cells."
+            )
+        if any(not isinstance(locset, (LocsetExpr, LocsetMask)) for locset in locsets):
+            raise TypeError("Each per-cell location row must be a LocsetExpr or LocsetMask.")
+        if any(not isinstance(mechanism, SynapsePlacement) for mechanism in mechanisms):
+            raise TypeError("Per-cell locset sequences currently support Synapse point mechanisms only.")
+
+        lengths = tuple(_resolved_locset_length(locset, self._morpho) for locset in locsets)
+        per_mechanism_rows = tuple(_split_synapse_rows(mechanism, lengths=lengths) for mechanism in mechanisms)
+        incoming = []
+        for row, (population_index, locset) in enumerate(zip(population_indices, locsets)):
+            row_mechanisms = tuple(rows[row] for rows in per_mechanism_rows)
+            for source, materialized in zip(mechanisms, row_mechanisms):
+                self._synapse_origins[id(materialized)] = source
+            incoming.append(
+                normalize_place_rule(
+                    locset,
+                    row_mechanisms,
+                    population_indices=(int(population_index),),
+                    aligned=False,
+                )
+            )
+        self._place_rules = merge_place_rules(self._place_rules, tuple(incoming))
+        self._invalidate_discretization_cache()
+
+    def _set_selected_population_parameters(self, population_indices, parameters) -> None:
+        """Store declaration-time overrides without changing population shape."""
+        self._raise_if_initialized("set CellView parameters")
+        unknown = set(parameters) - {"V_init", "V_th"}
+        if unknown:
+            raise KeyError(f"CellView.set() does not support parameters {sorted(unknown)!r}.")
+        indices = tuple(int(index) for index in population_indices)
+        for name, value in parameters.items():
+            overrides = self._population_parameter_overrides[name]
+            if value is None:
+                if name != "V_init":
+                    raise TypeError("CellView V_th must be a voltage quantity, not None.")
+                for index in indices:
+                    overrides.pop(index, None)
+                self._V_init_materialized = None
+                continue
+            normalized = _normalize_selected_voltage_parameter(
+                value,
+                count=len(indices),
+                n_cv=self.n_cv,
+                name=name,
+            )
+            for index, item in zip(indices, normalized):
+                overrides[index] = item
+            if name == "V_init":
+                self._V_init_materialized = None
+
+    def _materialize_population_parameter(self, name: str):
+        if name == "V_th":
+            value = bridge.fill_like(self.varshape, self._V_th)
+        elif name == "V_init":
+            initializer = self._V_init
+            if initializer is None:
+                initializer = bridge.cv_value_vector(self, attr_name="v")
+            elif not callable(initializer):
+                initializer = bridge.fill_like(self.varshape, initializer)
+            value = braintools.init.param(initializer, self.varshape)
+        else:  # pragma: no cover - internal invariant
+            raise KeyError(name)
+        return _apply_population_parameter_overrides(
+            value,
+            overrides=self._population_parameter_overrides[name],
+            name=name,
+        )
+
+    def _selected_population_parameter(self, name: str, population_indices):
+        if name == "V_th" and self._initialized:
+            values = self._V_th
+        elif name == "V_init" and self._V_init_materialized is not None:
+            values = self._V_init_materialized
+        else:
+            if name == "V_init" and callable(self._V_init):
+                raise RuntimeError(
+                    "CellView.V_init cannot inspect a callable initializer before init_state(); "
+                    "initialize the root Cell and inspect CellView.V_init or CellView.V."
+                )
+            values = self._materialize_population_parameter(name)
+        return _select_population_value(
+            values,
+            population_indices=tuple(population_indices),
+            population_size=self._population_size,
+        )
+
+    def paint(self, region: RegionExpr, *mechanisms) -> "Cell":
+        """Paint mechanisms onto ``region``. Returns ``self`` for chaining."""
+        self._raise_if_initialized("paint()")
+        self._paint_rules = merge_paint_rules(
+            self._paint_rules,
+            normalize_paint_rules(region, mechanisms),
+        )
+        self._invalidate_discretization_cache()
+        return self
+
+    def place(
+        self,
+        locset: LocsetExpr | LocsetMask | LocsetBatch,
+        *mechanisms,
+    ) -> "Cell":
+        """Place point mechanisms at shared or per-cell locations.
+
+        Parameters
+        ----------
+        locset : LocsetExpr, LocsetMask, LocsetBatch, or sequence
+            One shared locset, an aligned rectangular batch, or one possibly
+            ragged locset per population member.
+        *mechanisms : Point
+            Point-mechanism declarations placed independently at each row.
+
+        Returns
+        -------
+        Cell
+            This Cell for chaining.
+        """
+        self._raise_if_initialized("place()")
+        self._validate_synapse_names(mechanisms)
+        if _is_per_cell_locset_sequence(locset):
+            if len(self.pop_size) != 1:
+                raise ValueError(f"Per-cell locset placement requires one-dimensional pop_size; got {self.pop_size!r}.")
+            self._place_per_cell(tuple(range(int(self.pop_size[0]))), tuple(locset), mechanisms)
+            return self
+        population_indices = None
+        aligned = isinstance(locset, LocsetBatch)
+        if aligned:
+            if len(self.pop_size) != 1:
+                raise ValueError(f"LocsetBatch placement requires one-dimensional pop_size; got {self.pop_size!r}.")
+            population_indices = tuple(range(int(self.pop_size[0])))
+            if len(locset) != len(population_indices):
+                raise ValueError(
+                    "LocsetBatch batch rows must match the population size, "
+                    f"got {len(locset)!r} rows for {len(population_indices)!r} cells."
+                )
+        self._place_rules = merge_place_rules(
+            self._place_rules,
+            (
+                normalize_place_rule(
+                    locset,
+                    mechanisms,
+                    population_indices=population_indices,
+                    aligned=aligned,
+                ),
+            ),
+        )
+        self._invalidate_discretization_cache()
+        return self
+
+    def bind_synapse_input(self, synapse: str, source, *, weight=1.0, transform=None) -> "Cell":
+        """Deprecated compatibility adapter for per-boundary event payloads.
+
+        Parameters
+        ----------
+        synapse : str
+            Synapse instance name, matching ``braincell.mech.Synapse(name=...)``
+            or its default instance name.
+        source : array-like or callable
+            Presynaptic drive source. Callables are evaluated every step; this
+            supports bindings such as ``lambda: pre_cell.spike.value``.
+        weight : array-like, optional
+            Multiplicative weight applied to ``source``.
+        transform : callable, optional
+            Optional mapping called as ``transform(source_value)`` before
+            weighting, useful when the source shape does not directly broadcast
+            to the target synapse shape.
+        """
+        warnings.warn(
+            "Cell.bind_synapse_input() is deprecated; create an EventSource and use braincell.connect().",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        key = str(synapse)
+        self._synapse_input_bindings.setdefault(key, []).append((source, weight, transform))
+        return self
+
+    # ------------------------------------------------------------------
+    # Static discretization (valid in both phases)
+
+    def _invalidate_discretization_cache(self) -> None:
+        self._discretization_cache = None
+        self._discretization_cache_key = None
+        self._synapse_store_cache = None
+        self._clamp_store_cache = None
+        self._runtime_cvs_cache = None
+        self._runtime_nodes_cache = None
+        self._root_scope_cache = None
+        self._run_loop_cache.clear()
+
+    def _discretization_key(self) -> tuple[object, ...]:
+        # ``Morphology`` is mutable and shared -- ``cell.morpho`` hands the
+        # caller the very tree this cell discretizes -- so identity alone
+        # cannot say whether it still looks the way it did when the cache
+        # was filled. ``revision`` advances on every structural change;
+        # pairing it with the identity is the same test
+        # ``braincell.filter.SelectionCache`` applies.
+        #
+        # The ``id()`` is sound here, unlike for a temporary whose address
+        # can be recycled: this cell holds ``self._morpho`` alive for as
+        # long as the key it appears in, and both sites that reassign the
+        # attribute invalidate the cache outright.
+        return (
+            id(self._morpho),
+            self._morpho.revision,
+            self._discretization_policy,
+            self._paint_rules,
+            self._place_rules,
+        )
+
+    @property
+    def _discretization(self) -> Discretization:
+        key = self._discretization_key()
+        if self._discretization_cache is not None and self._discretization_cache_key == key:
+            return self._discretization_cache
+
+        # Everything below hangs off the discretization, so a key miss has
+        # to drop those caches too -- not just the one being rebuilt.
+        self._invalidate_discretization_cache()
+        discretization = build_discretization(
+            self._morpho,
+            policy=self._discretization_policy,
+            paint_rules=self._paint_rules,
+            place_rules=self._place_rules,
+        )
+        self._discretization_cache = discretization
+        self._discretization_cache_key = key
+        return discretization
+
+    def _root_scope(self) -> _CellScope:
+        """Return the cached unrestricted population/CV scope for this Cell.
+
+        The root scope materializes one entry per ``(population, CV)`` pair, so
+        rebuilding it per attribute access costs ``pop_size * n_cv`` tuples on
+        every ``cell.soma``, ``cell.channels``, or ``cell.record`` lookup. It
+        depends only on the discretization and is invalidated alongside it.
+        """
+        if self._root_scope_cache is None:
+            self._root_scope_cache = _CellScope.root(self)
+        return self._root_scope_cache
+
+    @property
+    def n_cv(self) -> int:
+        return len(self.cvs)
+
+    @property
+    def cvs(self) -> tuple[CV, ...]:
+        return self._discretization.cvs
+
+    @property
+    def cv_midpoints(self) -> LocsetMask:
+        """Return one resolved continuous midpoint for every control volume."""
+        cvs = self.cvs
+        return LocsetMask.from_columns(
+            [cv.branch_id for cv in cvs],
+            [cv.midpoint for cv in cvs],
+        )
+
+    @property
+    def cv_tree(self) -> CVTree:
+        return self._discretization.cv_tree
+
+    @property
+    def node_tree(self) -> NodeTree:
+        return self._discretization.node_tree
+
+    @property
+    def cv_contexts(self) -> tuple[CVContext, ...]:
+        """Return read-only spatial contexts in stable CV order.
+
+        Returns
+        -------
+        tuple of CVContext
+            Geometry and path-distance metadata used to resolve callable
+            cable and density parameters.
+        """
+        return self._discretization.cv_contexts
+
+    @property
+    def point_placements(self):
+        """Return point-mechanism placements in stable declaration order.
+
+        Returns
+        -------
+        tuple of PointPlacement
+            Static placement records available before and after initialization.
+        """
+        return self._discretization.point_placements
+
+    @property
+    def synapses(self) -> SynapseView:
+        """Return a view over all logical point-synapse instances."""
+        return SynapseView(self)
+
+    @property
+    def clamps(self) -> ClampView:
+        """Return a view over all logical current-clamp instances."""
+        return ClampView(self)
+
+    @property
+    def connections(self):
+        """Return a unified view over all direct event-routing rows."""
+        from braincell.network.connection import ConnectionView
+
+        return ConnectionView(self._get_connection_store())
+
+    @property
+    def event_outputs(self) -> EventOutputCollection:
+        """Return named live event-output ports for this cell population."""
+        return EventOutputCollection(self)
+
+    @property
+    def reductions(self) -> ReductionViewCollection:
+        """Return all Cell-local registered reduction models."""
+        return ReductionViewCollection(self, tuple(range(self._population_size)))
+
+    @property
+    def outputs(self) -> Mapping[str, object]:
+        """Return the selected model's initialized raw outputs."""
+        return self._selected_outputs(tuple(range(self._population_size)))
+
+    def add_reduction(self, name: str, model):
+        """Register one interchangeable reduced model under a Cell-local name."""
+        self._raise_if_initialized("add a reduction model")
+        if not isinstance(name, str) or not name:
+            raise ValueError("Reduction model name must be a non-empty string.")
+        if name == "detailed":
+            raise ValueError("Reduction model name 'detailed' is reserved for the full Cell model.")
+        if name in self._reduction_models:
+            raise ValueError(f"Cell already has a reduction model named {name!r}.")
+        required = ("init_state", "update", "reset_state", "reset")
+        missing = tuple(method for method in required if not callable(getattr(model, method, None)))
+        if missing:
+            raise TypeError(f"Reduction model {type(model).__name__!r} is missing callable methods {missing!r}.")
+        self._reduction_models[name] = model
+        self._run_loop_cache.clear()
+        return self.reductions[name]
+
+    def use_model(self, name: str = "detailed") -> "Cell":
+        """Select the detailed model or one registered reduction for the next initialization."""
+        self._raise_if_initialized("select a Cell execution model")
+        if name != "detailed" and name not in self._reduction_models:
+            raise KeyError(f"Unknown Cell model {name!r}; available reductions: {tuple(self._reduction_models)!r}.")
+        self._selected_model_name = name
+        self._run_loop_cache.clear()
+        self._compiled_recording_cache.clear()
+        return self
+
+    def _get_spike_event_source(self) -> _CellSpikeSource:
+        if self._spike_event_source_cache is None:
+            self._spike_event_source_cache = _CellSpikeSource(self)
+        return self._spike_event_source_cache
+
+    def _get_synapse_store(self) -> _SynapseStore:
+        """Return the private logical synapse store for the current declaration."""
+        if self._synapse_store_cache is None:
+            self._synapse_store_cache = _SynapseStore(self)
+        return self._synapse_store_cache
+
+    def _get_clamp_store(self) -> _ClampStore:
+        """Return the logical current-clamp store for this declaration."""
+        if self._clamp_store_cache is None:
+            self._clamp_store_cache = _ClampStore(self)
+        return self._clamp_store_cache
+
+    def _get_connection_store(self):
+        """Return the private Cell-owned routing-row store."""
+        if self._connection_store_cache is None:
+            from braincell.network.connection import _ConnectionStore
+
+            self._connection_store_cache = _ConnectionStore(self)
+        return self._connection_store_cache
+
+    def _validate_synapse_names(self, mechanisms) -> None:
+        """Reject one logical group name being reused across model types."""
+        declared = raise_on_name_type_conflict(
+            (mechanism.instance_name, mechanism.synapse_type)
+            for rule in self._place_rules
+            for mechanism in rule.mechanisms
+            if isinstance(mechanism, SynapsePlacement)
+        )
+        raise_on_name_type_conflict(
+            (
+                (mechanism.instance_name, mechanism.synapse_type)
+                for mechanism in mechanisms
+                if isinstance(mechanism, SynapsePlacement)
+            ),
+            known=declared,
+        )
+
+    @property
+    def recordings(self) -> Mapping[str, RecordingSpec]:
+        """Return a read-only snapshot of Cell recording declarations."""
+        return MappingProxyType(dict(self._recording_specs))
+
+    def _add_recording(self, spec: RecordingSpec) -> RecordingSpec:
+        self._raise_if_initialized("add a recording")
+        if spec.name in self._recording_specs:
+            raise ValueError(f"Cell already has a recording named {spec.name!r}.")
+        self._recording_specs[spec.name] = spec
+        self._compiled_recording_cache.clear()
+        self._run_loop_cache.clear()
+        return spec
+
+    def _compiled_recordings(self, dt) -> tuple:
+        self._raise_if_not_initialized("compile recordings")
+        dt_ms = scalar_decimal(dt, u.ms)
+        key = (dt_ms, tuple(self._recording_specs))
+        cached = self._compiled_recording_cache.get(key)
+        if cached is None:
+            cached = tuple(
+                compile_recording(self, spec, dt=dt)
+                for spec in self._recording_specs.values()
+                if recording_is_active(self, spec)
+            )
+            self._compiled_recording_cache[key] = cached
+        return cached
+
+    @property
+    def _uses_reduction(self) -> bool:
+        return self._selected_model_name != "detailed"
+
+    def _selected_outputs(self, population_indices: tuple[int, ...]) -> Mapping[str, object]:
+        if not self._initialized:
+            return MappingProxyType({})
+        if not self._uses_reduction:
+            values = {"voltage": self.V.value}
+        else:
+            values = {name: state.value for name, state in self._reduction_output_states.items()}
+        selected = {
+            name: _select_model_output(
+                value,
+                population_indices=population_indices,
+                population_size=self._population_size,
+                batch_size=self._runtime_batch_size,
+                detailed=not self._uses_reduction,
+            )
+            for name, value in values.items()
+        }
+        return MappingProxyType(selected)
+
+    def _validate_reduction_output(self, output) -> ReductionOutput:
+        if not isinstance(output, ReductionOutput):
+            raise TypeError(
+                f"Reduction model {self._selected_model_name!r} must return ReductionOutput, "
+                f"got {type(output).__name__!s}."
+            )
+        prefix = ((self._runtime_batch_size,) if self._runtime_batch_size is not None else ()) + self.pop_size
+        event_shape = tuple(getattr(output.event, "shape", ()))
+        if event_shape != prefix:
+            raise ValueError(f"Reduction event shape must be {prefix!r} for this Cell, got {event_shape!r}.")
+        for name, value in output.values.items():
+            shape = tuple(getattr(value, "shape", ()))
+            if shape[: len(prefix)] != prefix:
+                raise ValueError(
+                    f"Reduction output {name!r} must start with Cell runtime shape {prefix!r}, got {shape!r}."
+                )
+        return output
+
+    def _publish_reduction_output(self, output, *, initialize: bool = False) -> None:
+        output = self._validate_reduction_output(output)
+        if initialize:
+            self._reduction_output_states = {
+                name: brainstate.ShortTermState(value) for name, value in output.values.items()
+            }
+            self.spike = brainstate.ShortTermState(output.event)
+            return
+        if tuple(output.values) != tuple(self._reduction_output_states):
+            raise ValueError(
+                "Reduction output names must remain unchanged after init_state(); "
+                f"expected {tuple(self._reduction_output_states)!r}, got {tuple(output.values)!r}."
+            )
+        for name, value in output.values.items():
+            current = self._reduction_output_states[name].value
+            expected = tuple(current.shape)
+            actual = tuple(getattr(value, "shape", ()))
+            if actual != expected:
+                raise ValueError(f"Reduction output {name!r} changed shape from {expected!r} to {actual!r}.")
+            _require_same_value_type(current, value, name=f"Reduction output {name!r}")
+            self._reduction_output_states[name].value = value
+        _require_same_value_type(self.spike.value, output.event, name="Reduction event")
+        self.spike.value = output.event
+
+    def get_point_placement(self, placement_id: int):
+        """Return one static point placement by its stable id."""
+        if isinstance(placement_id, bool) or not isinstance(placement_id, (int, np.integer)):
+            raise TypeError("placement_id must be an integer.")
+        index = int(placement_id)
+        placements = self.point_placements
+        if index < 0 or index >= len(placements):
+            raise IndexError(f"placement_id out of range: {index!r}.")
+        return placements[index]
+
+    # ------------------------------------------------------------------
+    # Phase transitions
+
+    def init_state(self, batch_size=None) -> None:
+        """Lower the declaration into runtime state and allocate V / spike.
+
+        Raises
+        ------
+        RuntimeError
+            If the cell is already initialized. Call :meth:`reset` first.
+        """
+        self._raise_if_network_owned("init_state()")
+        self._raise_if_initialized("init_state()")
+
+        morpho = clone_morpho(self._morpho)
+        self._morpho = morpho
+        self._invalidate_discretization_cache()
+        _ = self._discretization
+        if batch_size is not None:
+            if isinstance(batch_size, bool) or not isinstance(batch_size, (int, np.integer)):
+                raise TypeError("Cell init_state() batch_size must be an integer or None.")
+            if int(batch_size) < 1:
+                raise ValueError("Cell init_state() batch_size must be >= 1.")
+        self._runtime_batch_size = None if batch_size is None else int(batch_size)
+        if self._uses_reduction:
+            self._init_reduction_state(batch_size=batch_size)
+            return
+        self._runtime = CellRuntimeState.from_cell(self)
+
+        # Save scalar V_th declaration before the vector overwrite below.
+        self._V_th_declaration = self._V_th
+
+        self._in_size = self.varshape
+        self._out_size = self.varshape
+
+        root_nodes = dict(self._runtime.ions)
+        for layout in self._runtime.layouts:
+            node = self._runtime.runtime_nodes.get(layout.id)
+            if node is None:
+                continue
+            if _is_root_level_runtime_node(layout.kind):
+                root_nodes[f"layout_{layout.id}"] = node
+
+        self.ion_channels = self._format_elements(IonChannel, **root_nodes)
+        if self.trainables.bindings():
+            self.trainables.materialize()
+        self.C = bridge.cv_value_vector(self, attr_name="cm")
+        self._V_th = self._materialize_population_parameter("V_th")
+
+        v_value = self._materialize_population_parameter("V_init")
+        self._V_init_materialized = v_value
+        v_value = bridge.expand_with_batch_axis(v_value, batch_size, name="Cell.V")
+        # A Cell is spatial: every hidden state's trailing axis enumerates
+        # CVs (V and painted density state) or sparse point-layout rows, so all
+        # are group states. Channel / ion / synapse code is shared with
+        # SingleCompartment, hence the scoped factory rather than a
+        # per-call-site class choice.
+        self.V = DiffEqGroupState(v_value)
+        self.spike = brainstate.ShortTermState(_zero_spike_like(self.V.value))
+        self._event_previous_V = brainstate.ShortTermState(self.V.value)
+        clamp_store = self._get_clamp_store()
+        self._step_clamp_components = brainstate.ShortTermState(
+            u.Quantity(jnp.zeros((len(clamp_store.id),), dtype=float), u.nA)
+        )
+        self._step_clamp_point_current = brainstate.ShortTermState(
+            u.Quantity(jnp.zeros(self._runtime.pop_size + (self._runtime.n_point,), dtype=float), u.nA)
+        )
+        self._point_V = brainstate.ShortTermState(self._initial_point_voltage(self.V.value))
+        self._current_time_state.value = 0.0 * u.ms
+
+        cv_V = self.V.value
+        with state_grouping(True):
+            for path, channel in self._runtime_objects_unchecked(IonChannel, allowed_hierarchy=(1, 1)).items():
+                args = self._runtime_node_phase_args(path, channel, cv_V)
+                channel.init_state(*args, batch_size=batch_size)
+            # Mechanism init hooks allocate state; reset hooks materialize the
+            # model-defined initial values from V_init and current parameters.
+            for path, channel in self._runtime_objects_unchecked(IonChannel, allowed_hierarchy=(1, 1)).items():
+                args = self._runtime_node_phase_args(path, channel, cv_V)
+                channel.reset_state(*args, batch_size=batch_size)
+
+        # Dense CV axial operators are only needed by derivative-based voltage
+        # solvers. The default DHS/staggered path builds its own static source,
+        # so defer this matrix until ``_get_axial_operator()`` is actually used.
+        self._runtime.axial_operator_np = None
+        self._runtime.axial_operator_cache = None
+        self._initialized = True
+        self._runtime_cvs_cache = self._build_runtime_cv_views()
+        self._runtime_nodes_cache = self._build_runtime_node_views()
+
+    def _init_reduction_state(self, *, batch_size=None) -> None:
+        """Allocate only packed synapse inputs plus the selected reduced model."""
+        self._in_size = self.pop_size
+        self._out_size = self.pop_size
+        self._reduction_input_runtime = build_reduction_input_runtime(self)
+        model = self._reduction_models[self._selected_model_name]
+        output = model.init_state(self._reduction_input_runtime.context, batch_size=batch_size)
+        self._publish_reduction_output(output, initialize=True)
+        self._pending_reduction_inputs = self._reduction_input_runtime.take_inputs()
+        self._current_time_state.value = 0.0 * u.ms
+        self._initialized = True
+
+    def reset(self) -> None:
+        """Drop runtime and per-step state; return to DECLARING.
+
+        Raises
+        ------
+        RuntimeError
+            If the cell is not initialized.
+
+        Notes
+        -----
+        ``reset()`` is distinct from :meth:`reset_state`. ``reset_state``
+        reseeds ``V`` / ``spike`` / ``current_time`` in place and stays
+        in the INITIALIZED phase. ``reset()`` fully tears down the
+        runtime and returns to DECLARING so ``paint`` / ``place`` can
+        run again.
+        """
+        self._raise_if_network_owned("reset()")
+        self._raise_if_not_initialized("reset()")
+
+        self.connections.clear_runtime()
+
+        if self._uses_reduction:
+            self._reduction_models[self._selected_model_name].reset()
+
+        for name in ("_in_size", "_out_size", "ion_channels", "C"):
+            if hasattr(self, name):
+                delattr(self, name)
+
+        # Restore scalar V_th (init_state overwrote it with a vector).
+        self._V_th = self._V_th_declaration
+
+        if hasattr(self, "V"):
+            delattr(self, "V")
+        if hasattr(self, "spike"):
+            delattr(self, "spike")
+        if hasattr(self, "_event_previous_V"):
+            delattr(self, "_event_previous_V")
+        for name in ("_step_clamp_components", "_step_clamp_point_current", "_point_V"):
+            if hasattr(self, name):
+                delattr(self, name)
+        self._current_time_state.value = 0.0 * u.ms
+
+        self._runtime = None
+        self._reduction_input_runtime = None
+        self._reduction_output_states = {}
+        self._pending_reduction_inputs = None
+        self._runtime_batch_size = None
+        self.trainables.runtime_reset()
+        self._runtime_cvs_cache = None
+        self._runtime_nodes_cache = None
+        self._node_scheduling_cache.clear()
+        self._run_loop_cache.clear()
+        self._compiled_recording_cache.clear()
+
+        self._morpho = self._declaration_morpho
+        self._invalidate_discretization_cache()
+        self._V_init_materialized = None
+
+        self._initialized = False
+
+    # ------------------------------------------------------------------
+    # Static topology + runtime inspection views
+
+    @property
+    def runtime(self) -> CellRuntimeState:
+        self._raise_if_not_initialized("runtime")
+        if self._uses_reduction:
+            raise RuntimeError("Detailed Cell runtime is unavailable while a reduction model is selected.")
+        return self._runtime
+
+    @property
+    def n_point(self) -> int:
+        self._raise_if_not_initialized("n_point")
+        if self._uses_reduction:
+            raise RuntimeError("Detailed point runtime is unavailable while a reduction model is selected.")
+        return self._runtime.n_point
+
+    @property
+    def pop_size(self) -> tuple[int, ...]:
+        return self._pop_size
+
+    @property
+    def _population_size(self) -> int:
+        if len(self.pop_size) == 0:
+            return 1
+        if len(self.pop_size) != 1:
+            raise ValueError(f"Cell population views require one-dimensional pop_size; got {self.pop_size!r}.")
+        return int(self.pop_size[0])
+
+    @property
+    def _view_root(self) -> "Cell":
+        return self
+
+    @property
+    def varshape(self) -> tuple[int, ...]:
+        return self.pop_size + (self.n_cv,)
+
+    @property
+    def n_compartment(self) -> int:
+        return self.varshape[-1]
+
+    def runtime_objects(self, *args, **kwargs):
+        """Return runtime graph objects from the inherited container API."""
+        self._raise_if_not_initialized("runtime_objects()")
+        return self._runtime_objects_unchecked(*args, **kwargs)
+
+    def _runtime_objects_unchecked(self, *args, **kwargs):
+        """Return runtime graph objects without an initialization guard."""
+        return super().nodes(*args, **kwargs)
+
+    @property
+    def runtime_cvs(self) -> tuple[RuntimeCVView, ...]:
+        self._raise_if_not_initialized("runtime_cvs")
+        if self._runtime_cvs_cache is None:
+            self._runtime_cvs_cache = self._build_runtime_cv_views()
+        return self._runtime_cvs_cache
+
+    @property
+    def runtime_nodes(self) -> tuple[RuntimeNodeView, ...]:
+        self._raise_if_not_initialized("runtime_nodes")
+        if self._runtime_nodes_cache is None:
+            self._runtime_nodes_cache = self._build_runtime_node_views()
+        return self._runtime_nodes_cache
+
+    def _build_runtime_cv_views(self) -> tuple[RuntimeCVView, ...]:
+        runtime = self.runtime
+        node_tree = self.node_tree
+        return tuple(
+            RuntimeCVView(
+                id=int(cv.id),
+                declaration=cv,
+                layout_ids=tuple(int(layout.id) for layout in runtime.get_cv_layouts(int(cv.id))),
+                mid_node_id=int(node_tree.cv_to_mid_node_id[int(cv.id)]),
+                ions=self._build_local_ion_bindings(cv_ids=(int(cv.id),)),
+            )
+            for cv in self.cvs
+        )
+
+    def _build_runtime_node_views(self) -> tuple[RuntimeNodeView, ...]:
+        runtime = self.runtime
+        return tuple(
+            RuntimeNodeView(
+                id=int(node.id),
+                declaration=node,
+                layout_ids=tuple(int(layout.id) for layout in runtime.get_point_layouts(int(node.id))),
+                source_cv_ids=node.source_cv_ids,
+                ions=self._build_local_ion_bindings(point_ids=(int(node.id),)),
+            )
+            for node in self.node_tree.nodes
+        )
+
+    def _build_local_ion_bindings(
+        self,
+        *,
+        cv_ids: tuple[int, ...] = (),
+        point_ids: tuple[int, ...] = (),
+    ) -> Mapping[str, RuntimeIonBinding]:
+        runtime = self.runtime
+        return {
+            name: RuntimeIonBinding(
+                name=name,
+                runtime=ion,
+                cell=self,
+                cv_ids=cv_ids,
+                point_ids=point_ids,
+            )
+            for name, ion in runtime.ions.items()
+        }
+
+    def node_scheduling(self, *, max_group_size: int = 256, algorithm: str = "dhs"):
+        self._raise_if_not_initialized("node_scheduling()")
+        return self._node_scheduling_unchecked(max_group_size=max_group_size, algorithm=algorithm)
+
+    def _node_scheduling_unchecked(self, *, max_group_size: int = 256, algorithm: str = "dhs"):
+        key = (algorithm, int(max_group_size))
+        cached = self._node_scheduling_cache.get(key)
+        if cached is not None:
+            return cached
+        scheduling = build_node_scheduling(
+            self.node_tree,
+            max_group_size=max_group_size,
+            algorithm=algorithm,
+        )
+        self._node_scheduling_cache[key] = scheduling
+        return scheduling
+
+    # ------------------------------------------------------------------
+    # Time
+
+    @property
+    def current_time(self):
+        self._raise_if_not_initialized("current_time")
+        return self._current_time_state.value
+
+    def _set_current_time(self, value) -> None:
+        self._current_time_state.value = value
+
+    # ------------------------------------------------------------------
+    # Repr
+
+    def __repr__(self) -> str:
+        if self._initialized:
+            return (
+                f"Cell(root={self._morpho.root.name!r}, n_cv={self.n_cv!r}, n_point={self.n_point!r}, initialized=True)"
+            )
+        return (
+            f"Cell(root={self._morpho.root.name!r}, "
+            f"n_branches={len(self._morpho.branches)}, "
+            f"n_paint_rules={len(self._paint_rules)}, "
+            f"n_place_rules={len(self._place_rules)}, "
+            f"initialized=False)"
+        )
+
+    # ------------------------------------------------------------------
+    # Bridging (runtime-only)
+
+    def _cv_to_point(self, cv_values):
+        self._raise_if_not_initialized("_cv_to_point()")
+        return bridge.cv_to_point(cv_values, self._runtime)
+
+    def _initial_point_voltage(self, cv_values):
+        """Expand CV voltage to every point for the initial DHS linearization."""
+
+        return cv_values[..., self._runtime.point_to_representative_cv_np]
+
+    def _dhs_point_voltage(self, cv_values=None):
+        """Return cached DHS point voltage with current midpoint values."""
+
+        values = self.V.value if cv_values is None else cv_values
+        point_values = self._point_V.value
+        midpoint_ids = self._runtime.node_tree.cv_to_mid_node_id
+        return point_values.at[..., midpoint_ids].set(values)
+
+    def _set_dhs_point_voltage(self, point_values):
+        """Publish one complete point-tree voltage solution."""
+
+        self._point_V.value = point_values
+
+    def _point_voltage_for_mechanisms(self, cv_values=None):
+        """Return the electrical point voltage used by the active solver."""
+
+        values = self.V.value if cv_values is None else cv_values
+        if self._solver_name in {"staggered", "dhs_voltage"} and hasattr(self, "_point_V"):
+            return self._dhs_point_voltage(values)
+        return bridge.cv_to_point(values, self._runtime)
+
+    def _cv_to_point_unchecked(self, cv_values):
+        return bridge.cv_to_point(cv_values, self._runtime)
+
+    def _point_to_cv(self, point_values):
+        self._raise_if_not_initialized("_point_to_cv()")
+        return bridge.point_to_cv(point_values, self._runtime)
+
+    # ------------------------------------------------------------------
+    # Solver path (runtime-only)
+
+    def _resolve_t(self):
+        try:
+            return brainstate.environ.get("t")
+        except KeyError:
+            return self.current_time
+
+    def pre_integral(self):
+        self._raise_if_not_initialized("pre_integral()")
+        for path, node in self.runtime_objects(IonChannel, allowed_hierarchy=(1, 1)).items():
+            if not isinstance(node, IndependentIntegration):
+                args = self._runtime_node_phase_args(path, node, self.V.value)
+                node.pre_integral(*args)
+
+    def compute_derivative(self):
+        self._raise_if_not_initialized("compute_derivative()")
+        self.V.derivative = self.compute_voltage_derivative(self.V.value)
+        for path, node in self.runtime_objects(IonChannel, allowed_hierarchy=(1, 1)).items():
+            if not isinstance(node, IndependentIntegration):
+                args = self._runtime_node_phase_args(path, node, self.V.value)
+                node.compute_derivative(*args)
+
+    def compute_membrane_derivative(self, V):
+        self._raise_if_not_initialized("compute_membrane_derivative()")
+        t = self._resolve_t()
+        I_total = currents.total_membrane_current(self, V_cv=V, t=t)
+        return I_total / self.C
+
+    def _voltage_linearizer(self):
+        """Return the configured voltage-only membrane linearizer."""
+        membrane_derivative = jax.named_call(
+            self.compute_membrane_derivative,
+            name="braincell_dhs_compute_membrane_derivative",
+        )
+        return brainstate.transform.vector_grad(
+            membrane_derivative,
+            argnums=0,
+            return_value=True,
+            unit_aware=False,
+        )
+
+    def _get_axial_operator(self):
+        runtime = self._runtime
+        if runtime is None:
+            raise RuntimeError("_get_axial_operator() requires init_state() first.")
+        float_dtype = jnp.asarray(0.0).dtype
+        cache = runtime.axial_operator_cache
+        if cache is not None and cache.float_dtype == float_dtype:
+            return cache.operator
+
+        if runtime.axial_operator_np is None:
+            runtime.axial_operator_np = np.asarray(
+                build_cv_axial_operator(
+                    self,
+                    node_tree=self.node_tree,
+                    scheduling=self._node_scheduling_unchecked(algorithm="dhs"),
+                ),
+                dtype=np.float64,
+            )
+
+        operator = jnp.asarray(runtime.axial_operator_np, dtype=brainstate.environ.dftype()) * (u.ms**-1)
+        cache = AxialOperatorCache(float_dtype=float_dtype, operator=operator)
+        if not is_traced_value(operator):
+            runtime.axial_operator_cache = cache
+        return operator
+
+    def compute_axial_derivative(self, V):
+        self._raise_if_not_initialized("compute_axial_derivative()")
+        V_mv = u.Quantity(u.math.asarray(V.to_decimal(u.mV)), u.mV)
+        axial_operator = self._get_axial_operator()
+        return -u.math.matmul(V_mv, axial_operator.T)
+
+    def compute_voltage_derivative(self, V):
+        return self.compute_membrane_derivative(V) + self.compute_axial_derivative(V)
+
+    def _top_level_ion_channel_nodes(self):
+        return tuple(self.nodes(IonChannel, allowed_hierarchy=(1, 1)).items())
+
+    def _family_ion_nodes(self):
+        return tuple((path, node) for path, node in self._top_level_ion_channel_nodes() if isinstance(node, Ion))
+
+    def _family_channel_nodes(self):
+        nodes = []
+        for path, node in self._top_level_ion_channel_nodes():
+            # ``Ion`` and ``MixIons`` are siblings, not a hierarchy
+            # (both derive from ``IonChannel, Container``), and a channel
+            # under either is reached the same way.
+            if isinstance(node, (Ion, MixIons)):
+                for child_path, child in brainstate.graph.nodes(
+                    node,
+                    Channel,
+                    allowed_hierarchy=(1, 1),
+                ).items():
+                    if getattr(child, "_skip_family_update", False):
+                        continue
+                    nodes.append((path + child_path, child))
+            elif isinstance(node, Channel):
+                nodes.append((path, node))
+        return tuple(nodes)
+
+    def _integrate_selected_ion_self_states(
+        self,
+        ion_nodes,
+        selected_paths,
+        cv_V,
+        excluded_paths,
+    ):
+        selected_paths = tuple(tuple(path) for path in selected_paths)
+        if not selected_paths:
+            return
+
+        selected_path_set = set(selected_paths)
+
+        def _run_phase(hook_name):
+            for path, ion in ion_nodes:
+                if path in selected_path_set:
+                    getattr(ion, hook_name)(cv_V, recursive_child=False)
+
+        _ind_exp_euler_step_selected(
+            self,
+            include_paths=selected_paths,
+            excluded_paths=excluded_paths,
+            pre_integral=lambda: _run_phase("pre_integral"),
+            compute_derivative=lambda: _run_phase("compute_derivative"),
+            post_integral=lambda: _run_phase("post_integral"),
+            allow_empty=True,
+        )
+
+    def _update_ion_channels_by_integration(self, cv_V):
+        with jax.named_scope("braincell:ion_update:integration:dependent"):
+            for path, node in self._top_level_ion_channel_nodes():
+                if isinstance(node, IndependentIntegration):
+                    continue
+                args = self._runtime_node_phase_args(path, node, cv_V)
+                with jax.named_scope(_scope_name("braincell:ion_update:node", path, node)):
+                    jax.named_call(
+                        ind_exp_euler_step,
+                        name=_call_name("braincell:ion_update:node_step", path, node),
+                    )(node, *args)
+
+        with jax.named_scope("braincell:ion_update:integration:independent"):
+            for path, node in self._top_level_ion_channel_nodes():
+                args = self._runtime_node_phase_args(path, node, cv_V)
+                with jax.named_scope(_scope_name("braincell:ion_update:node", path, node)):
+                    jax.named_call(
+                        node.ind_update,
+                        name=_call_name("braincell:ion_update:node_ind_update", path, node),
+                    )(*args)
+
+    def _update_ion_channel_families(self, cv_V):
+        ion_nodes = self._family_ion_nodes()
+        channel_nodes = self._family_channel_nodes()
+
+        dependent_ion_paths = [path for path, node in ion_nodes if not isinstance(node, IndependentIntegration)]
+        channel_paths = [path for path, _ in channel_nodes]
+
+        # Family mode splits ion self states from channel states. This phase
+        # advances dependent Ion states only; V and all channel states are
+        # excluded explicitly so no child channel is integrated through Ion
+        # recursion.
+        with jax.named_scope("braincell:ion_update:family:dependent_ion_self"):
+            self._integrate_selected_ion_self_states(
+                ion_nodes,
+                dependent_ion_paths,
+                cv_V,
+                excluded_paths=[("V",), *channel_paths],
+            )
+
+        # Independent Ion states use their own updater, still without
+        # recursing into child channels.
+        with jax.named_scope("braincell:ion_update:family:independent_ion"):
+            for path, node in ion_nodes:
+                if isinstance(node, IndependentIntegration):
+                    with jax.named_scope(_scope_name("braincell:ion_update:ion", path, node)):
+                        jax.named_call(
+                            node.ind_update,
+                            name=_call_name("braincell:ion_update:ion_ind_update", path, node),
+                        )(cv_V, recursive_child=False)
+
+        # Channel nodes include Ion child channels, MixIons child channels,
+        # and top-level channels. The owner path rebuilds the right ion args.
+        with jax.named_scope("braincell:ion_update:family:dependent_channel"):
+            for path, node in channel_nodes:
+                if not self._is_independent_channel(node):
+                    target, args = self._channel_integration_target_and_args(
+                        path,
+                        node,
+                        cv_V,
+                    )
+                    with jax.named_scope(_scope_name("braincell:ion_update:channel", path, node)):
+                        jax.named_call(
+                            ind_exp_euler_step,
+                            name=_call_name("braincell:ion_update:channel_step", path, node),
+                        )(target, *args)
+
+        # Independent channels finish through their own update rule.
+        with jax.named_scope("braincell:ion_update:family:independent_channel"):
+            for path, node in channel_nodes:
+                if not self._is_independent_channel(node):
+                    continue
+                target, args = self._channel_integration_target_and_args(
+                    path,
+                    node,
+                    cv_V,
+                )
+                with jax.named_scope(_scope_name("braincell:ion_update:channel", path, node)):
+                    jax.named_call(
+                        target.ind_update,
+                        name=_call_name("braincell:ion_update:channel_ind_update", path, node),
+                    )(*args)
+
+    @staticmethod
+    def _is_independent_channel(node):
+        channel = getattr(node, "_channel", node)
+        return isinstance(channel, IndependentIntegration)
+
+    def _channel_integration_target_and_args(self, path, node, cv_V):
+        if hasattr(node, "_channel") and hasattr(node, "_infos"):
+            return node._channel, (cv_V, *node._infos())
+        return node, self._channel_update_args(path, node, cv_V)
+
+    def _channel_update_args(self, path, node, cv_V):
+        if len(path) >= 4 and path[-2] == "channels":
+            owner = self._node_at_path(path[:-2])
+            if isinstance(owner, Ion):
+                return cv_V, owner.pack_info()
+            if isinstance(owner, MixIons):
+                infos = tuple([owner._get_ion(root).pack_info() for root in node.root_type.__args__])
+                return (cv_V, *infos)
+        return (cv_V,)
+
+    def _runtime_node_phase_args(self, path, node, cv_V):
+        if isinstance(node, RuntimeSynapse):
+            layout_id = layout_id_from_key(path)
+            layout = self._runtime.layouts[layout_id]
+            if layout.point_index is None:
+                raise ValueError(f"Synapse layout {layout.id!r} is missing point_index.")
+            point_V = bridge.cv_to_point(cv_V, self._runtime)
+            return (layout.gather_points(point_V),)
+        return self._channel_update_args(path, node, cv_V)
+
+    @staticmethod
+    def _node_at_path_from(root, path):
+        node = root
+        for part in path:
+            if isinstance(node, dict):
+                node = node[part]
+            else:
+                node = getattr(node, part)
+        return node
+
+    def _node_at_path(self, path):
+        return self._node_at_path_from(self, path)
+
+    def cache_ion_total_currents(self, V=None) -> None:
+        """Cache ion source currents before voltage advances in staggered mode."""
+        self._raise_if_not_initialized("cache_ion_total_currents()")
+        if not self.cache_ion_total_current:
+            return
+        cv_V = self.V.value if V is None else V
+        for path, node in self.runtime_objects(IonChannel, allowed_hierarchy=(1, 1)).items():
+            if not getattr(type(node), "uses_total_current", False):
+                continue
+            with jax.named_scope(_scope_name("braincell:ion_current_cache:node", path, node)):
+                try:
+                    node._cached_total_current = jax.named_call(
+                        node.current,
+                        name=_call_name("braincell:ion_current_cache:node_current", path, node),
+                    )(cv_V, include_external=True)
+                except TypeError:
+                    node._cached_total_current = jax.named_call(
+                        node.current,
+                        name=_call_name("braincell:ion_current_cache:node_current", path, node),
+                    )(cv_V)
+
+    def clear_ion_total_current_cache(self) -> None:
+        """Remove per-step ion source-current caches."""
+        self._raise_if_not_initialized("clear_ion_total_current_cache()")
+        for _, node in self.runtime_objects(IonChannel, allowed_hierarchy=(1, 1)).items():
+            if hasattr(node, "_cached_total_current"):
+                delattr(node, "_cached_total_current")
+
+    def post_integral(self):
+        self._raise_if_not_initialized("post_integral()")
+        self.V.value = self.sum_delta_inputs(init=self.V.value)
+        for path, node in self.runtime_objects(IonChannel, allowed_hierarchy=(1, 1)).items():
+            if not isinstance(node, IndependentIntegration):
+                args = self._runtime_node_phase_args(path, node, self.V.value)
+                node.post_integral(*args)
+
+    def update(self):
+        """Advance the cell by one simulation step.
+
+        This method is the standalone cell-level step wrapper. It applies
+        already-prepared synaptic events, advances continuous membrane and
+        mechanism dynamics by one ``dt``, computes the spike output, and
+        prepares synaptic input for the next standalone step.
+
+        Returns
+        -------
+        object
+            Spike value produced by the transition from the previous membrane
+            voltage to the updated membrane voltage.
+
+        Notes
+        -----
+        The standalone update order is:
+
+        1. Apply prepared runtime synapse events.
+        2. Advance voltage and mechanism dynamics through ``self.solver``.
+        3. Detect and store the current spike.
+        4. Prepare discrete event payloads for the next step.
+
+        In network execution, delayed event delivery is scheduled outside the
+        cell. ``Network.run(...)`` writes arrivals into runtime state buffers
+        before calling the corresponding internal cell phases.
+        """
+        self._raise_if_not_initialized("update()")
+        self._prepare_step_clamps()
+        self._begin_step()
+        with brainstate.environ.context(_braincell_step_clamps_prepared=True):
+            spk = self._update_dynamics()
+        self._prepare_next_synapse_inputs(t=self._resolve_t() + brainstate.environ.get_dt())
+        return spk
+
+    def _begin_step(self):
+        """Apply prepared discrete synaptic events at step start.
+
+        Notes
+        -----
+        The public membrane voltage is stored in CV space, while placed
+        runtime synapses live on morphology point layouts. This method first
+        projects ``V`` from CVs to points, then calls each runtime synapse's
+        ``apply_events`` hook.
+
+        This phase consumes synaptic input that has already been prepared or
+        delivered; it does not integrate continuous synapse dynamics.
+        """
+        self._raise_if_not_initialized("_begin_step()")
+        if self._uses_reduction:
+            self._pending_reduction_inputs = self._reduction_input_runtime.take_inputs()
+            return
+        point_V = self._point_voltage_for_mechanisms(self.V.value)
+        self._apply_runtime_synapse_events(point_V)
+
+    def _prepare_step_clamps(self, *, t=None, dt=None) -> None:
+        """Sample all current clamps at the main-step midpoint and cache them."""
+        self._raise_if_not_initialized("_prepare_step_clamps()")
+        if self._uses_reduction:
+            return
+        if len(self._get_clamp_store().id) == 0:
+            return
+        step_t = self._resolve_t() if t is None else t
+        step_dt = brainstate.environ.get_dt() if dt is None else dt
+        components = self._get_clamp_store().evaluate(self._runtime, t=step_t + 0.5 * step_dt)
+        self._step_clamp_components.value = components
+        self._step_clamp_point_current.value = self._get_clamp_store().scatter_to_points(
+            components,
+            pop_size=self._runtime.pop_size,
+            n_point=self._runtime.n_point,
+        )
+
+    def _solver_clamp_point_current(self, *, t):
+        """Return the prepared point current, with a direct-solver fallback."""
+        if len(self._get_clamp_store().id) == 0:
+            return self._step_clamp_point_current.value
+        if brainstate.environ.get("_braincell_step_clamps_prepared", False):
+            return self._step_clamp_point_current.value
+        try:
+            dt = brainstate.environ.get_dt()
+        except KeyError:
+            return self._runtime.evaluate_point_clamps(t=t)
+        if u.get_unit(dt).is_unitless:
+            return self._runtime.evaluate_point_clamps(t=t)
+        components = self._get_clamp_store().evaluate(self._runtime, t=t + 0.5 * dt)
+        return self._get_clamp_store().scatter_to_points(
+            components,
+            pop_size=self._runtime.pop_size,
+            n_point=self._runtime.n_point,
+        )
+
+    def _update_dynamics(self):
+        """Advance continuous cell dynamics and update spike state.
+
+        Returns
+        -------
+        object
+            Spike value computed from the transition between the old and new
+            membrane voltage.
+
+        Notes
+        -----
+        This method requires ``brainstate.environ['dt']`` to be set. The
+        selected solver is responsible for advancing membrane voltage and
+        mechanism states.
+
+        For the default ``"staggered"`` solver, the typical order is:
+
+        1. Cache ion total currents when enabled.
+        2. Advance membrane voltage with the DHS voltage solver.
+        3. Integrate runtime synapse continuous dynamics.
+        4. Update ion and channel states.
+        5. Clear temporary current caches.
+        6. Detect threshold crossing and write ``self.spike``.
+        """
+        self._raise_if_not_initialized("_update_dynamics()")
+
+        if brainstate.environ.get("dt", None) is None:
+            raise ValueError("Cell.update(...) requires brainstate.environ['dt'] to be set.")
+        if self._uses_reduction:
+            output = self._reduction_models[self._selected_model_name].update(self._pending_reduction_inputs)
+            self._publish_reduction_output(output)
+            return self.spike.value
+
+        last_V = self.V.value
+        self._event_previous_V.value = last_V
+
+        with jax.named_scope("braincell:cell_update:solver"):
+            self.solver(self)
+
+        with jax.named_scope("braincell:cell_update:clear_ion_total_current_cache"):
+            self.clear_ion_total_current_cache()
+
+        with jax.named_scope("braincell:cell_update:spike_update"):
+            spk = self.get_spike(last_V, self.V.value)
+            self.spike.value = spk
+        return spk
+
+    def _prepare_next_synapse_inputs(self, *, t=None):
+        """Prepare runtime synapse inputs for a later step.
+
+        Notes
+        -----
+        This method projects the updated CV voltage to point space and
+        rebuilds the runtime synapse event payload. In standalone
+        ``Cell.update()``, the prepared input is consumed by the next call to
+        ``update``.
+
+        In network execution, delayed arrivals are written by the network
+        delivery layer before this preparation phase.
+        """
+        self._raise_if_not_initialized("_prepare_next_synapse_inputs()")
+        if self._uses_reduction:
+            if t is None:
+                self._prepare_runtime_synapse_inputs(None)
+            else:
+                with brainstate.environ.context(t=t):
+                    self._prepare_runtime_synapse_inputs(None)
+            return
+        point_V = self._point_voltage_for_mechanisms(self.V.value)
+        if t is None:
+            self._prepare_runtime_synapse_inputs(point_V)
+        else:
+            with brainstate.environ.context(t=t):
+                self._prepare_runtime_synapse_inputs(point_V)
+
+    def _apply_runtime_synapse_events(self, point_V):
+        """Apply bound discrete events to all runtime synapses.
+
+        Parameters
+        ----------
+        point_V : Quantity
+            Membrane voltage projected onto morphology point layouts.
+
+        Notes
+        -----
+        Runtime synapses receive point-local voltage because placed synapse
+        mechanisms are indexed by point layout. The bound discrete event drive
+        should already be present on each synapse before this method is called.
+        """
+        self._raise_if_not_initialized("_apply_runtime_synapse_events()")
+        for layout, synapse in self._runtime.iter_synapse_layouts():
+            if layout.id not in self._runtime.event_buffers:
+                continue
+            payload = self._runtime.get_event_buffer(layout.id)
+            args = (layout.gather_points(point_V),)
+            synapse.apply_events(payload, *args)
+            self._runtime.clear_event_buffer(layout.id)
+
+    def _prepare_runtime_synapse_inputs(self, point_V):
+        """Bind this step's presynaptic drive to runtime synapses.
+
+        Parameters
+        ----------
+        point_V : Quantity
+            Membrane voltage projected onto morphology point layouts.
+
+        Notes
+        -----
+        ``SynapsePlacement`` is the ``cell.place(...)`` declaration, while
+        ``RuntimeSynapse`` is the executable point mechanism. This method only
+        prepares discrete input; synapse dynamics are integrated later by the
+        active solver schedule.
+
+        For each runtime synapse layout, the total discrete drive is assembled
+        from three sources:
+
+        1. The private per-layout event buffer, where network delivery writes
+           delayed events.
+        2. Direct Connection arrivals evaluated at the current simulation time.
+        3. User-bound inputs registered with ``bind_synapse_input``.
+
+        The accumulated payload is consumed at the next event boundary.
+        """
+        _ = point_V
+        self._raise_if_not_initialized("_prepare_runtime_synapse_inputs()")
+        t = self._resolve_t()
+        for layout in self._event_layouts():
+            if layout.id not in self._event_runtime().event_buffers:
+                continue
+            total_drive = self._event_runtime().get_event_buffer(layout.id)
+            contact_drive = self._evaluate_contact_inputs(
+                layout,
+                t=t,
+                template=total_drive,
+                scheduled_only=True,
+            )
+            total_drive = total_drive + _coerce_drive_like(contact_drive, total_drive)
+            total_drive = total_drive + self._evaluate_bound_synapse_inputs(
+                layout,
+                total_drive,
+            )
+            self._set_event_buffer(layout.id, total_drive)
+
+    def _evaluate_contact_inputs(self, layout, *, t, template, scheduled_only=True):
+        """Return weighted Connection arrivals addressed to one synapse layout."""
+        if layout.placement_index is None:
+            return u.math.zeros_like(template)
+        dt = brainstate.environ.get("dt", None)
+        if dt is None:
+            raise ValueError("Connection event delivery requires brainstate.environ['dt'].")
+
+        output = _zeros_like_event_template(template)
+        synapse_store = self._get_synapse_store()
+        for connection in self.connections._call_views(scheduled=scheduled_only):
+            synapse_type = str(connection.synapse_type[0])
+            if synapse_store.layout_id(synapse_type) != int(layout.id):
+                continue
+            row_index = np.arange(len(connection), dtype=np.int32)
+            local_index = synapse_store.runtime_rows(connection.synapse_id).astype(np.int32)
+            event_count = connection.source.event_count(
+                connection.source_index[row_index],
+                t=t,
+                delay=connection.delay[row_index],
+                dt=dt,
+            )
+            connection_weight = connection.weight
+            if connection_weight is not None:
+                connection_weight = connection_weight[row_index]
+            contribution = event_count * u.math.asarray(_connection_event_weight(template, connection_weight))
+            output = output.at[local_index].add(contribution)
+        return _rewrap_event_template(template, output)
+
+    def _apply_direct_live_connection_events(self) -> None:
+        """Route live direct sources and run target handlers at this boundary."""
+        live_connections = self.connections._call_views(scheduled=False)
+        if not live_connections:
+            return
+        dt = brainstate.environ.get("dt", None)
+        if dt is None:
+            raise ValueError("Live Connection delivery requires brainstate.environ['dt'].")
+        t = self._resolve_t()
+        layouts = self._event_layouts()
+        drives = {}
+        event_runtime = self._event_runtime()
+        for layout in layouts:
+            if layout.id not in event_runtime.event_buffers:
+                continue
+            drives[layout.id] = _zeros_like_event_template(event_runtime.get_event_buffer(layout.id))
+
+        synapse_store = self._get_synapse_store()
+        for connection in live_connections:
+            counts = connection.event_count(t=t, dt=dt)
+            synapse_type = str(connection.synapse_type[0])
+            layout_id = synapse_store.layout_id(synapse_type)
+            if layout_id not in drives:
+                continue
+            template = event_runtime.get_event_buffer(layout_id)
+            contribution = counts * u.math.asarray(_connection_event_weight(template, connection.weight))
+            local_indices = synapse_store.runtime_rows(connection.synapse_id).astype(np.int32)
+            drives[layout_id] = drives[layout_id].at[local_indices].add(contribution)
+
+        point_v = None if self._uses_reduction else self._cv_to_point(self.V.value)
+        for layout in layouts:
+            if layout.id not in drives:
+                continue
+            template = event_runtime.get_event_buffer(layout.id)
+            drive = _rewrap_event_template(template, drives[layout.id])
+            self._apply_synapse_layout_event_drive(layout.id, drive, point_v=point_v)
+
+    def _apply_synapse_layout_event_drive(self, layout_id: int, drive, *, point_v=None) -> None:
+        """Apply one already-aggregated boundary payload to a runtime layout."""
+        if self._uses_reduction:
+            current = self._reduction_input_runtime.get_event_buffer(layout_id)
+            self._set_event_buffer(layout_id, current + _coerce_drive_like(drive, current))
+            return
+        layout = self._runtime.layouts[int(layout_id)]
+        synapse = self._runtime.get_runtime_node(layout.id)
+        if point_v is None:
+            point_v = self._cv_to_point(self.V.value)
+        args = (layout.gather_points(point_v),)
+        synapse.apply_events(drive, *args)
+
+    def _event_runtime(self):
+        """Return the detailed or reduced owner of packed event buffers."""
+        return self._reduction_input_runtime if self._uses_reduction else self._runtime
+
+    def _event_layouts(self):
+        """Return executable synapse input layouts without exposing runtime nodes."""
+        if self._uses_reduction:
+            return self._reduction_input_runtime.layouts
+        return tuple(layout for layout, _ in self._runtime.iter_synapse_layouts())
+
+    def _event_layout(self, layout_id: int):
+        """Return one input layout by its stable runtime id."""
+        for layout in self._event_layouts():
+            if int(layout.id) == int(layout_id):
+                return layout
+        raise KeyError(f"Unknown synapse event layout id {layout_id!r}.")
+
+    def _set_event_buffer(self, layout_id: int, value) -> None:
+        self._event_runtime().event_buffers[int(layout_id)].value = value
+
+    def _write_event_arrival(self, layout_id: int, arrival) -> None:
+        """Merge one Network arrival with any event staged for this boundary."""
+        if self._uses_reduction:
+            current = self._reduction_input_runtime.get_event_buffer(layout_id)
+            arrival = current + _coerce_drive_like(arrival, current)
+        self._set_event_buffer(layout_id, arrival)
+
+    def _evaluate_bound_synapse_inputs(self, layout, template):
+        drive = u.math.zeros_like(template)
+        if layout.synapse_index is None:
+            return drive
+        layout_ids = np.asarray(layout.synapse_index, dtype=np.int64)
+        for instance_name, bindings in self._synapse_input_bindings.items():
+            target = self.synapses[instance_name]
+            if len(target) == 0:
+                continue
+            selected_ids = target.id[np.isin(target.id, layout_ids)]
+            if selected_ids.size == 0:
+                continue
+            rows = self._get_synapse_store().runtime_rows(selected_ids)
+            selected_template = template[..., rows]
+            for source, weight, transform in bindings:
+                value = source() if callable(source) else source
+                if transform is not None:
+                    value = transform(value)
+                try:
+                    contribution = _coerce_drive_like(value * weight, selected_template)
+                    drive = _scatter_drive_rows(drive, rows, contribution)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Bound synapse input for {instance_name!r} cannot broadcast "
+                        f"from shape {getattr(value, 'shape', None)!r} to "
+                        f"{getattr(selected_template, 'shape', None)!r}."
+                    ) from exc
+        return drive
+
+    def _update_runtime_synapses(self, point_V):
+        """Advance runtime synapse dynamics.
+
+        Parameters
+        ----------
+        point_V : Quantity
+            Membrane voltage projected onto morphology point layouts.
+
+        Notes
+        -----
+        This helper refreshes discrete synaptic input and then integrates
+        runtime synapse continuous states. It is used by solver schedules that
+        update synapses as part of the post-voltage mechanism phase.
+        """
+        self._prepare_runtime_synapse_inputs(point_V)
+        self._integrate_runtime_synapse_dynamics(point_V)
+
+    def _integrate_runtime_synapse_dynamics(self, point_V):
+        """Integrate continuous runtime synapse states.
+
+        Parameters
+        ----------
+        point_V : Quantity
+            Membrane voltage projected onto morphology point layouts.
+
+        Notes
+        -----
+        Only runtime synapse nodes are advanced here. Discrete events should
+        already have been applied before this method is called.
+        """
+        for path, node in self.runtime_objects(IonChannel, allowed_hierarchy=(1, 1)).items():
+            if not isinstance(node, RuntimeSynapse):
+                continue
+            layout_id = layout_id_from_key(path)
+            layout = self._runtime.layouts[layout_id]
+            args = (layout.gather_points(point_V),)
+            with jax.named_scope(_scope_name("braincell:synapse_update:runtime", path, node)):
+                jax.named_call(
+                    ind_exp_euler_step,
+                    name=_call_name("braincell:synapse_update:runtime_step", path, node),
+                )(node, *args)
+
+    def reset_state(self, batch_size=None) -> None:
+        """Reseed ``V`` / ``spike`` / ``current_time`` without leaving INITIALIZED.
+
+        Distinct from :meth:`reset`: ``reset_state`` is the in-phase
+        brainstate lifecycle hook; ``reset`` tears down the runtime
+        entirely and returns the cell to DECLARING.
+        """
+        self._raise_if_network_owned("reset_state()")
+        self._raise_if_not_initialized("reset_state()")
+        if self._uses_reduction:
+            requested_batch = None if batch_size is None else int(batch_size)
+            if requested_batch != self._runtime_batch_size:
+                raise ValueError(
+                    "Reduced Cell reset_state() must preserve the init_state() batch size; "
+                    f"expected {self._runtime_batch_size!r}, got {requested_batch!r}."
+                )
+            self.connections.reset_runtime()
+            self._reduction_input_runtime.clear_event_buffers()
+            output = self._reduction_models[self._selected_model_name].reset_state(batch_size=batch_size)
+            self._publish_reduction_output(output)
+            self._pending_reduction_inputs = self._reduction_input_runtime.take_inputs()
+            self._current_time_state.value = 0.0 * u.ms
+            return
+        if self.trainables.bindings():
+            self.trainables.materialize()
+        self.connections.reset_runtime()
+        v_value = self._materialize_population_parameter("V_init")
+        self._V_init_materialized = v_value
+        self.V.value = bridge.expand_with_batch_axis(v_value, batch_size, name="Cell.V")
+        self._point_V.value = self._initial_point_voltage(self.V.value)
+        self.spike.value = _zero_spike_like(self.V.value)
+        self._event_previous_V.value = self.V.value
+        self._current_time_state.value = 0.0 * u.ms
+        self._step_clamp_components.value = u.Quantity(jnp.zeros_like(self._step_clamp_components.value.mantissa), u.nA)
+        self._step_clamp_point_current.value = u.Quantity(
+            jnp.zeros_like(self._step_clamp_point_current.value.mantissa), u.nA
+        )
+        for layout_id in self._runtime.event_buffers:
+            self._runtime.clear_event_buffer(layout_id)
+        with state_grouping(True):
+            for path, channel in self.runtime_objects(IonChannel, allowed_hierarchy=(1, 1)).items():
+                args = self._runtime_node_phase_args(path, channel, self.V.value)
+                channel.reset_state(*args, batch_size=batch_size)
+
+    # ------------------------------------------------------------------
+    # Inspection forwards (runtime-only)
+
+    @property
+    def layouts(self):
+        self._raise_if_not_initialized("layouts")
+        if self._uses_reduction:
+            raise RuntimeError("Detailed mechanism layouts are unavailable while a reduction model is selected.")
+        return self._runtime.layouts
+
+    @property
+    def voltage_shape(self):
+        self._raise_if_not_initialized("voltage_shape")
+        return self._runtime.voltage_shape
+
+    def get_point_layouts(self, point_id):
+        self._raise_if_not_initialized("get_point_layouts()")
+        return self._runtime.get_point_layouts(point_id)
+
+    def get_cv_layouts(self, cv_id):
+        self._raise_if_not_initialized("get_cv_layouts()")
+        return self._runtime.get_cv_layouts(cv_id)
+
+    def expected_state_shape(self, layout_id, var_name):
+        self._raise_if_not_initialized("expected_state_shape()")
+        return self._runtime.expected_state_shape(layout_id, var_name)
+
+    def get_state(self, layout_id, var_name):
+        self._raise_if_not_initialized("get_state()")
+        return self._runtime.get_state(layout_id, var_name)
+
+    def set_state(self, layout_id, var_name, value) -> None:
+        self._raise_if_not_initialized("set_state()")
+        self._runtime.set_state(layout_id, var_name, value)
+
+    def get_point_state(self, point_id):
+        self._raise_if_not_initialized("get_point_state()")
+        return self._runtime.get_point_state(point_id)
+
+    def get_placement_state(self, placement_id):
+        """Return runtime state for one independent point placement."""
+        self._raise_if_not_initialized("get_placement_state()")
+        self.get_point_placement(placement_id)
+        return self._runtime.get_placement_state(placement_id)
+
+    def get_cv_state(self, cv_id):
+        self._raise_if_not_initialized("get_cv_state()")
+        return self._runtime.get_cv_state(cv_id)
+
+    def get_runtime_node(self, layout_id):
+        self._raise_if_not_initialized("get_runtime_node()")
+        return self._runtime.get_runtime_node(layout_id)
+
+    def get_ion(self, name):
+        self._raise_if_not_initialized("get_ion()")
+        return self._runtime.get_ion(name)
+
+    # ------------------------------------------------------------------
+    # Probes + mech_table (runtime-only)
+
+    def sample_probe(self, name: str):
+        self._raise_if_not_initialized("sample_probe()")
+        if self._uses_reduction:
+            raise KeyError(f"Detailed probe {name!r} is inactive while a reduction model is selected.")
+        return probes.sample_probe(self, name)
+
+    def sample_probes(self) -> dict[str, object]:
+        self._raise_if_not_initialized("sample_probes()")
+        if self._uses_reduction:
+            return {}
+        return probes.sample_probes(self)
+
+    def mech_table(self) -> MechanismObjectTable:
+        """Return the point-domain mechanism table for this cell.
+
+        Returns
+        -------
+        braincell._compute.table.MechanismObjectTable
+            Rows are mechanism identities, columns are point ids.
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`init_state` has not been called.
+        """
+        self._raise_if_not_initialized("mech_table()")
+        if self._uses_reduction:
+            raise RuntimeError("Detailed mechanism inspection is unavailable while a reduction model is selected.")
+        return build_mechanism_object_table(self._runtime, self.cvs)
+
+    # ------------------------------------------------------------------
+    # Run (auto-inits from DECLARING)
+
+    def run(self, *, dt, duration):
+        """Run the cell for ``duration`` at ``dt`` and return probe traces.
+
+        If :meth:`init_state` has not been called yet, ``run`` calls it
+        automatically. Once initialized the cell will *not* be
+        re-initialized on subsequent ``run`` invocations.
+        """
+        owner = self.network_owner
+        if owner is not None:
+            owner_name = owner.name if owner.name is not None else "<unnamed>"
+            raise RuntimeError(f"Cell belongs to Network {owner_name!r}; run it through Network {owner_name!r}.")
+        if not self._initialized:
+            self.init_state()
+        elif not self._uses_reduction and self.trainables.bindings():
+            self.trainables.materialize()
+        return run_module.run(self, dt=dt, duration=duration)
+
+
+#: Alias of :class:`Cell`, named for what the model is rather than for the
+#: shorthand. ``MultiCompartment is Cell`` — the two names are the same
+#: object, so ``isinstance``, subclassing, and pickling behave identically
+#: through either. Prefer it when the surrounding code also mentions
+#: :class:`~braincell.SingleCompartment` and the contrast matters.
+MultiCompartment = Cell
+
+
+# ----------------------------------------------------------------------
+# Helpers
+
+
+def _is_per_cell_locset_sequence(value) -> bool:
+    """Return whether ``value`` is the public sequence-of-locsets form."""
+    if isinstance(value, (LocsetExpr, LocsetMask, LocsetBatch, str, bytes)):
+        return False
+    return isinstance(value, (tuple, list))
+
+
+def _resolved_locset_length(locset, morpho: Morphology) -> int:
+    """Resolve only the row count needed for parameter broadcasting."""
+    if isinstance(locset, LocsetExpr):
+        return len(locset.evaluate(morpho))
+    return len(locset)
+
+
+def _split_synapse_rows(
+    mechanism: SynapsePlacement,
+    *,
+    lengths: tuple[int, ...],
+) -> tuple[SynapsePlacement, ...]:
+    """Materialize per-cell declaration params for rectangular or ragged rows."""
+    parameter_rows = {
+        name: _split_synapse_parameter_rows(value, lengths=lengths, name=name)
+        for name, value in mechanism.params.items()
+    }
+    return tuple(
+        SynapsePlacement(
+            mechanism.synapse_type,
+            name=mechanism.name,
+            **{name: rows[row] for name, rows in parameter_rows.items()},
+        )
+        for row in range(len(lengths))
+    )
+
+
+def _split_synapse_parameter_rows(value, *, lengths: tuple[int, ...], name: str) -> tuple[object, ...]:
+    """Split one synapse parameter according to per-cell location lengths."""
+    n_row = len(lengths)
+    n_total = int(sum(lengths))
+    common_length = lengths[0] if lengths and all(length == lengths[0] for length in lengths) else None
+
+    if _is_ragged_parameter_sequence(value, n_row=n_row):
+        rows = []
+        for row, (item, length) in enumerate(zip(value, lengths)):
+            rows.append(_normalize_synapse_parameter_row(item, length=length, name=name, row=row))
+        return tuple(rows)
+
+    unit = value.unit if isinstance(value, u.Quantity) else None
+    array = np.asarray(value.to_decimal(unit) if unit is not None else value)
+    if array.shape == ():
+        return tuple(value for _ in lengths)
+    if common_length is not None and array.shape == (common_length,):
+        return tuple(_with_optional_unit(np.array(array, copy=True), unit) for _ in lengths)
+    if array.shape == (n_row, 1):
+        return tuple(_with_optional_unit(array[row, 0], unit) for row in range(n_row))
+    if common_length is not None and array.shape == (n_row, common_length):
+        return tuple(_with_optional_unit(np.array(array[row], copy=True), unit) for row in range(n_row))
+    if array.shape == (n_total,):
+        rows = []
+        offset = 0
+        for length in lengths:
+            rows.append(_with_optional_unit(np.array(array[offset : offset + length], copy=True), unit))
+            offset += length
+        return tuple(rows)
+    raise ValueError(
+        f"Synapse parameter {name!r} with shape {array.shape!r} cannot broadcast to "
+        f"per-cell location lengths {lengths!r}."
+    )
+
+
+def _is_ragged_parameter_sequence(value, *, n_row: int) -> bool:
+    if not isinstance(value, (tuple, list)) or len(value) != n_row:
+        return False
+    return any(isinstance(item, (tuple, list)) or getattr(item, "shape", ()) not in ((), None) for item in value)
+
+
+def _normalize_synapse_parameter_row(value, *, length: int, name: str, row: int):
+    unit = value.unit if isinstance(value, u.Quantity) else None
+    array = np.asarray(value.to_decimal(unit) if unit is not None else value)
+    if array.shape == ():
+        return value
+    if array.shape != (length,):
+        raise ValueError(
+            f"Synapse parameter {name!r} row {row!r} must be scalar or shape {(length,)!r}, got {array.shape!r}."
+        )
+    return _with_optional_unit(np.array(array, copy=True), unit)
+
+
+def _with_optional_unit(value, unit):
+    return u.Quantity(value, unit) if unit is not None else value
+
+
+def _select_local_values(values, *, ids: tuple[int, ...]):
+    """Return one localized item or a small indexed slice from an array-like."""
+    if len(ids) == 1:
+        return values[int(ids[0])]
+    return values[list(int(idx) for idx in ids)]
+
+
+def _select_population_value(value, *, population_indices: tuple[int, ...], population_size: int):
+    """Gather the population axis of an array-like value when it has one."""
+    shape = tuple(getattr(value, "shape", ()))
+    if len(shape) == 0:
+        return value
+    if len(shape) >= 2 and shape[-2] == population_size:
+        axis = len(shape) - 2
+    elif shape[0] == population_size:
+        axis = 0
+    else:
+        return value
+    index = [slice(None)] * len(shape)
+    index[axis] = np.asarray(population_indices, dtype=np.int32)
+    return value[tuple(index)]
+
+
+def _select_model_output(
+    value,
+    *,
+    population_indices: tuple[int, ...],
+    population_size: int,
+    batch_size: int | None,
+    detailed: bool,
+):
+    """Gather the explicit population axis from a detailed or reduced output."""
+    shape = tuple(getattr(value, "shape", ()))
+    if not shape:
+        return value
+    axis = (1 if batch_size is not None else 0) if not detailed else len(shape) - 2
+    if shape[axis] != population_size:
+        raise RuntimeError(f"Cell output population axis has size {shape[axis]!r}; expected {population_size!r}.")
+    index = [slice(None)] * len(shape)
+    index[axis] = np.asarray(population_indices, dtype=np.int32)
+    return value[tuple(index)]
+
+
+def _require_same_value_type(previous, current, *, name: str) -> None:
+    """Require one reduced output to preserve dtype and exact unit."""
+    previous_unit = u.get_unit(previous)
+    current_unit = u.get_unit(current)
+    if previous_unit != current_unit:
+        raise TypeError(f"{name} changed unit from {previous_unit!r} to {current_unit!r}.")
+    previous_dtype = jnp.asarray(u.get_magnitude(previous)).dtype
+    current_dtype = jnp.asarray(u.get_magnitude(current)).dtype
+    if previous_dtype != current_dtype:
+        raise TypeError(f"{name} changed dtype from {previous_dtype!r} to {current_dtype!r}.")
+
+
+def _select_packed_population_value(value, *, owners: np.ndarray, population_indices: tuple[int, ...]):
+    """Gather packed point-instance rows owned by selected population members."""
+    shape = tuple(getattr(value, "shape", ()))
+    if len(shape) == 0:
+        return value
+    selected = np.flatnonzero(np.isin(np.asarray(owners), np.asarray(population_indices)))
+    if shape[0] == len(owners):
+        return value[selected]
+    if shape[-1] == len(owners):
+        return value[..., selected]
+    return value
+
+
+def _normalize_selected_voltage_parameter(value, *, count: int, n_cv: int, name: str) -> tuple[object, ...]:
+    """Normalize selected cell-level voltage declarations to one CV row each."""
+    if not isinstance(value, u.Quantity):
+        raise TypeError(f"CellView {name} must be a voltage quantity.")
+    try:
+        decimal = np.asarray(value.to_decimal(u.mV), dtype=np.float64)
+    except Exception as exc:
+        raise ValueError(f"CellView {name} must have voltage units.") from exc
+
+    target_shape = (count, n_cv)
+    if decimal.ndim == 0:
+        normalized = np.broadcast_to(decimal, target_shape)
+    elif decimal.shape == (count,):
+        normalized = np.broadcast_to(decimal[:, None], target_shape)
+    elif count == 1 and decimal.shape == (n_cv,):
+        normalized = decimal[None, :]
+    else:
+        try:
+            normalized = np.broadcast_to(decimal, target_shape)
+        except ValueError as exc:
+            raise ValueError(
+                f"CellView {name} with shape {decimal.shape!r} cannot broadcast to {target_shape!r}."
+            ) from exc
+    return tuple(u.Quantity(np.array(row, copy=True), u.mV) for row in normalized)
+
+
+def _apply_population_parameter_overrides(value, *, overrides: Mapping[int, object], name: str):
+    """Scatter per-cell declaration overrides into an existing dense value."""
+    if not overrides:
+        return value
+    if not isinstance(value, u.Quantity):
+        raise TypeError(f"Cell {name} must materialize as a voltage quantity before applying CellView overrides.")
+    unit = value.unit
+    decimal = np.array(value.to_decimal(unit), copy=True)
+    if decimal.ndim != 2:
+        raise ValueError(f"Cell {name} must have population-by-CV shape, got {decimal.shape!r}.")
+    for population_index, row in overrides.items():
+        decimal[int(population_index)] = row.to_decimal(unit)
+    return u.Quantity(decimal, unit)
+
+
+def _coerce_drive_like(value, template):
+    """Coerce dimensionless zero drives to a quantity template unit."""
+    if isinstance(template, u.Quantity) and not isinstance(value, u.Quantity):
+        return value * template.unit
+    return value
+
+
+def _scatter_drive_rows(target, rows, contribution):
+    """Add selected event-drive rows without changing the target unit."""
+    rows = np.asarray(rows, dtype=np.int32)
+    if isinstance(target, u.Quantity):
+        if not isinstance(contribution, u.Quantity):
+            raise TypeError("Synapse drive contribution requires a quantity.")
+        mantissa = jnp.asarray(target.to_decimal(target.unit))
+        values = jnp.asarray(contribution.to_decimal(target.unit))
+        return u.Quantity(mantissa.at[..., rows].add(values), target.unit)
+    if isinstance(contribution, u.Quantity):
+        raise TypeError("Dimensionless synapse drive cannot consume a quantity contribution.")
+    return jnp.asarray(target).at[..., rows].add(jnp.asarray(contribution))
+
+
+def _resolve_solver(solver):
+    if isinstance(solver, str):
+        return solver, get_integrator(solver)
+    if callable(solver):
+        return getattr(solver, "__name__", type(solver).__name__), solver
+    raise TypeError(f"solver must be str or callable, got {type(solver).__name__!s}.")
+
+
+def _resolve_subsolver_schedule(subsolver, substeps):
+    if subsolver is None and substeps is None:
+        subsolver = "backward_euler"
+        substeps = 1
+    elif subsolver is None or substeps is None:
+        raise ValueError("subsolver and substeps must be provided together or both be None.")
+    if isinstance(substeps, bool):
+        raise TypeError("substeps must be an integer, got bool.")
+    try:
+        normalized_substeps = operator.index(substeps)
+    except TypeError as exc:
+        raise TypeError(f"substeps must be an integer, got {type(substeps).__name__!s}.") from exc
+    if normalized_substeps < 1:
+        raise ValueError(f"substeps must be at least 1, got {normalized_substeps!r}.")
+    solver_name, solver_fn = _resolve_solver(subsolver)
+    return solver_name, solver_fn, normalized_substeps
+
+
+def _zeros_like_event_template(template):
+    """Build a zeroed mantissa array shaped like one event buffer template."""
+    raw = template.to_decimal(template.unit) if isinstance(template, u.Quantity) else template
+    return jnp.zeros_like(jnp.asarray(raw))
+
+
+def _rewrap_event_template(template, mantissa):
+    """Restore the event buffer template's unit onto an accumulated mantissa."""
+    return u.Quantity(mantissa, template.unit) if isinstance(template, u.Quantity) else mantissa
+
+
+def _connection_event_weight(template, connection_weight):
+    """Coerce one Connection weight into its target event buffer's unit system.
+
+    Parameters
+    ----------
+    template : array_like or brainunit.Quantity
+        Event buffer the weighted arrivals are accumulated into.
+    connection_weight : array_like, brainunit.Quantity, or None
+        Declared Connection weight, already narrowed to the contributing rows.
+        ``None`` marks a trigger-only Connection.
+
+    Returns
+    -------
+    array_like
+        Weight expressed in ``template``'s unit, ready to multiply event counts.
+
+    Raises
+    ------
+    TypeError
+        If the weight and the target event buffer disagree on dimensionality.
+    """
+    if connection_weight is None:
+        if isinstance(template, u.Quantity):
+            raise TypeError("Trigger-only Connection cannot target a physical event buffer.")
+        return 1.0
+    if isinstance(template, u.Quantity):
+        if not isinstance(connection_weight, u.Quantity):
+            raise TypeError("Connection weight is dimensionless but its target event buffer is not.")
+        return connection_weight.to_decimal(template.unit)
+    if isinstance(connection_weight, u.Quantity):
+        raise TypeError("Connection weight has units but its target event buffer is dimensionless.")
+    return connection_weight
+
+
+_RANK0_POP_SIZE_MESSAGE = (
+    "Cell requires a population axis, so pop_size must not be empty. "
+    "Use pop_size=1 for a single cell; runtime state is then shaped "
+    "pop_size + (n_cv,). The trailing compartment axis is what makes every "
+    "Cell hidden state a brainstate.HiddenGroupState, which requires rank >= 2."
+)
+
+
+def _normalize_pop_size(pop_size) -> tuple[int, ...]:
+    """Normalize the public ``Cell(pop_size=...)`` argument.
+
+    A ``Cell`` always carries a population axis: the canonical shape has at
+    least one entry, so runtime state is at least two-dimensional
+    (``pop_size + (n_cv,)``). See ``docs/specs/2026-08-13-cell-hidden-group-state.md``
+    for why rank-0 populations are rejected.
+
+    Parameters
+    ----------
+    pop_size : int, sequence of int, or None
+        User-facing homogeneous population shape. ``None`` means
+        "unspecified" and normalizes to ``(1,)``.
+
+    Returns
+    -------
+    tuple of int
+        Canonical population-shape tuple, never empty.
+
+    Raises
+    ------
+    TypeError
+        If ``pop_size`` is not an integer or sequence of integers.
+    ValueError
+        If any requested dimension is non-positive, or if an explicitly
+        empty ``pop_size`` is given.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        >>> from braincell._multi_compartment.cell import _normalize_pop_size
+        >>> _normalize_pop_size(None)
+        (1,)
+        >>> _normalize_pop_size(4)
+        (4,)
+        >>> _normalize_pop_size((2, 3))
+        (2, 3)
+    """
+    if pop_size is None:
+        return (1,)
+    if isinstance(pop_size, (int, np.integer)):
+        if int(pop_size) <= 0:
+            raise ValueError(f"pop_size must be > 0, got {pop_size!r}.")
+        return (int(pop_size),)
+    if isinstance(pop_size, (tuple, list)):
+        if len(pop_size) == 0:
+            raise ValueError(_RANK0_POP_SIZE_MESSAGE)
+        normalized = []
+        for dim in pop_size:
+            if not isinstance(dim, (int, np.integer)):
+                raise TypeError(f"pop_size entries must be integers, got {type(dim).__name__!s}.")
+            dim = int(dim)
+            if dim <= 0:
+                raise ValueError(f"pop_size entries must be > 0, got {pop_size!r}.")
+            normalized.append(dim)
+        return tuple(normalized)
+    raise TypeError(f"pop_size must be int or tuple/list of int, got {type(pop_size).__name__!s}.")
+
+
+def _validate_ion_channel_update_order(value: str) -> str:
+    # "family" is the ion-before-channel schedule; "integration" is the
+    # previous schedule grouped by IndependentIntegration at the top level.
+    if value not in {"family", "integration"}:
+        raise ValueError(f"ion_channel_update_order must be 'family' or 'integration', got {value!r}.")
+    return value
+
+
+def _validate_membrane_linearizer(value: str) -> str:
+    if value not in {"point", "generic"}:
+        raise ValueError(f"membrane_linearizer must be 'point' or 'generic', got {value!r}.")
+    return value

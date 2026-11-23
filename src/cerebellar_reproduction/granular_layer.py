@@ -249,12 +249,13 @@ def _place_route(
     ]
     mechanisms = {}
     specs = []
+    synapse_spec = getattr(mech, "SynapseSpec", mech.Synapse)
     for mechanism in route.mechanisms:
         suffix = "nmda" if "NMDA" in mechanism.__name__ else (
             "gaba" if "GABA" in mechanism.__name__ else "ampa"
         )
         name = f"{route.name}_{suffix}"
-        specs.append(mech.Synapse(mechanism.__name__, name=name, temperature_celsius=temperature_celsius))
+        specs.append(synapse_spec(mechanism.__name__, name=name, temperature_celsius=temperature_celsius))
         mechanisms[suffix] = name
     target[post_ids].place(locations, *specs)
     return PlacedRoute(target, pre_events, source_index, receiver_index, place_cells, mechanisms)

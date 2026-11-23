@@ -4,50 +4,114 @@
 from __future__ import annotations
 
 import argparse
+from hashlib import sha256
+from inspect import signature
 import json
 from pathlib import Path
+import subprocess
+import sys
 from time import perf_counter
 
-import braincell as bc
 import brainunit as u
 import numpy as np
 
-from cerebellar_reproduction.granular_layer import GOC, GRC, MF, ROUTES, build_granular_layer
-from cerebellar_reproduction.validation import validate_export
-from junction import RECORDING, Junction
+from junction import CONDUCTANCE_NS, CV_VOLTAGE_RECORDING, NativeJunction
 
 
 ROOT = Path(__file__).resolve().parent
-NEURON_POPULATIONS = (GRC, GOC)
+DEFAULT_JUNCTION_ROOT = Path("/home/merveille/copneuron/braincell-junction")
+RESULT_FOLDERS = {"native": "with_native_junction", "explicit": "with_junction", "off": "without_junction"}
 
 
-def run_forward(duration_ms: float, dt_ms: float, output: Path, *, enable_junctions: bool = True) -> dict:
+def _runtime_digest(root: Path) -> str:
+    digest = sha256()
+    for path in sorted((root / "braincell").rglob("*.py")):
+        if path.name.endswith("_test.py") or path.name.startswith("test_"):
+            continue
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def _load_braincell(mode: str, junction_root: Path):
+    if mode == "native":
+        junction_root = junction_root.expanduser().resolve()
+        entry = junction_root / "braincell/__init__.py"
+        if not entry.is_file():
+            raise FileNotFoundError(f"BrainCell Junction worktree not found at {junction_root}.")
+        digest = _runtime_digest(junction_root)
+        sys.path.insert(0, str(junction_root))
+
+    import braincell as bc
+
+    if mode != "native":
+        if bc.__version__ != "0.2.0":
+            raise RuntimeError("The archived explicit and uncoupled modes use the BrainCell 0.2.0 wheel.")
+        return bc, {"source": "pypi_release", "version": bc.__version__}
+    if Path(bc.__file__).resolve() != entry or not hasattr(bc.Network, "connect_junction"):
+        raise RuntimeError(f"Expected the native Junction API from {junction_root}; loaded {bc.__file__}.")
+    revision = subprocess.check_output(["git", "-C", str(junction_root), "rev-parse", "HEAD"], text=True).strip()
+    return bc, {
+        "source": "local_native_junction_worktree",
+        "version": bc.__version__,
+        "worktree": str(junction_root),
+        "git_head": revision,
+        "runtime_python_sha256": digest,
+    }
+
+
+def run_forward(
+    duration_ms: float, dt_ms: float, output: Path, *,
+    junction_mode: str = "native", junction_root: Path = DEFAULT_JUNCTION_ROOT,
+) -> dict:
+    bc, runtime = _load_braincell(junction_mode, junction_root)
+    from cerebellar_reproduction.granular_layer import GOC, GRC, MF, ROUTES, build_granular_layer
+    from cerebellar_reproduction.validation import validate_export
+
     spec = ROOT / "data/spec"
+    morphologies = ROOT / "data/morphologies.hdf5"
     validate_export(spec)
     with np.load(spec / f"populations/{MF}.npz", allow_pickle=False) as data:
         mossy_ids = data["source_ids"]
     burst = np.arange(0.25, 8.0, 0.4)
     started = perf_counter()
+    builder_options = {}
+    if "gap_conductance_ns" in signature(build_granular_layer).parameters:
+        # Some local parent worktrees can wire gap contacts themselves. This
+        # runner owns Junction installation so each contact is registered once.
+        builder_options["gap_conductance_ns"] = 0.0
     network, report = build_granular_layer(
         spec,
-        ROOT / "data/morphologies.hdf5",
+        morphologies,
         ROOT / "assets/braincell",
         full=True,
         mossy_spike_times_ms=dict.fromkeys(mossy_ids.tolist(), burst),
+        **builder_options,
     )
     report.pop("braincell_module", None)
     report["selection"] = "seed_318_simplified_network"
+    report["braincell_runtime"] = runtime
+    report["junction_mode"] = junction_mode
     junction = None
-    if enable_junctions:
-        junction = Junction.install(
-            network.populations[GOC].cell, spec, ROOT / "data/morphologies.hdf5"
-        )
+    recording = None
+    if junction_mode == "native":
+        junction = NativeJunction.install(network, network.populations[GOC].cell, spec, morphologies)
+        recording = CV_VOLTAGE_RECORDING
+    elif junction_mode == "explicit":
+        from explicit_junction import RECORDING, ExplicitJunction
+
+        junction = ExplicitJunction.install(network.populations[GOC].cell, spec, morphologies)
+        recording = RECORDING
+    if junction is not None:
         report["routes"]["gap_goc"].update(junction.metadata())
-        del report["excluded"]["gap_goc"]
+        report["excluded"].pop("gap_goc", None)
     build_seconds = perf_counter() - started
     print(f"Built {network.connections.n_rows:,} event routes in {build_seconds:.1f} s.", flush=True)
+    if junction is not None:
+        print(f"Registered {len(junction.endpoints)} {junction_mode} Junction contacts.", flush=True)
 
-    for population in NEURON_POPULATIONS:
+    for population in (GRC, GOC):
         network.populations[population].cell.soma.record("soma_v", bc.observe.state("v"))
     for route in ROUTES:
         for receptor in report["routes"][route.name].get("mechanisms", {}):
@@ -57,12 +121,21 @@ def run_forward(duration_ms: float, dt_ms: float, output: Path, *, enable_juncti
     started = perf_counter()
     result = network.run(dt=dt_ms * u.ms, duration=duration_ms * u.ms)
     simulation_seconds = perf_counter() - started
+    if junction_mode == "native" and _runtime_digest(Path(runtime["worktree"])) != runtime["runtime_python_sha256"]:
+        raise RuntimeError("The native BrainCell runtime sources changed during this forward run.")
 
     arrays = {}
     junction_current = None
     if junction is not None:
-        sample = result.samples[GOC][RECORDING]
-        junction_current = np.asarray(sample.values.to_decimal(u.pA)).reshape(len(result.time), -1, 2)
+        sample = result.samples[GOC][recording]
+        if junction_mode == "native":
+            endpoint_v = junction.endpoint_voltage(sample, len(result.time))
+            into_first = CONDUCTANCE_NS * (endpoint_v[..., 1] - endpoint_v[..., 0])
+            junction_current = np.stack((into_first, -into_first), axis=-1)
+            arrays["junction_endpoint_voltage_mV"] = endpoint_v
+            arrays["junction_endpoint_cv_ids"] = junction.cv_ids
+        else:
+            junction_current = np.asarray(sample.values.to_decimal(u.pA)).reshape(len(result.time), -1, 2)
         if not np.isfinite(junction_current).all():
             raise RuntimeError("Junction currents contain non-finite values.")
         np.testing.assert_allclose(junction_current[..., 0], -junction_current[..., 1], rtol=0, atol=1e-5)
@@ -71,7 +144,7 @@ def run_forward(duration_ms: float, dt_ms: float, output: Path, *, enable_juncti
 
     soma_ranges = {}
     peak_conductance = {}
-    for population in NEURON_POPULATIONS:
+    for population in (GRC, GOC):
         with np.load(spec / f"populations/{population}.npz", allow_pickle=False) as data:
             source_ids = np.sort(data["source_ids"])
         samples = result.samples[population]
@@ -86,7 +159,7 @@ def run_forward(duration_ms: float, dt_ms: float, output: Path, *, enable_juncti
         arrays[f"{population}_spike_source_ids"] = source_ids[spikes.source_id]
         soma_ranges[population] = [float(soma_v.min()), float(soma_v.max())]
         for name, block in samples.items():
-            if name in {"soma_v", RECORDING}:
+            if name in {"soma_v", recording}:
                 continue
             values = np.asarray(block.values.to_decimal(u.nS))
             if not np.isfinite(values).all():
@@ -127,15 +200,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duration-ms", type=float, default=18.0)
     parser.add_argument("--dt-ms", type=float, default=0.05)
-    parser.add_argument("--no-junctions", action="store_true", help="reproduce the uncoupled baseline")
-    parser.add_argument("--output", type=Path, help="default: results/with_junction or results/without_junction")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--junction-mode", choices=tuple(RESULT_FOLDERS), default="native")
+    modes.add_argument("--no-junctions", dest="junction_mode", action="store_const", const="off",
+                       help="reproduce the uncoupled baseline")
+    parser.add_argument("--braincell-junction-root", type=Path, default=DEFAULT_JUNCTION_ROOT)
+    parser.add_argument("--output", type=Path, help="default: results/<selected-mode folder>")
     args = parser.parse_args()
     if not (np.isfinite(args.dt_ms) and np.isfinite(args.duration_ms) and 0 < args.dt_ms <= args.duration_ms):
         parser.error("Require a finite duration at least as long as one positive integration step.")
-    output = args.output if args.output is not None else (
-        ROOT / "results" / ("without_junction" if args.no_junctions else "with_junction")
+    output = args.output if args.output is not None else ROOT / "results" / RESULT_FOLDERS[args.junction_mode]
+    report = run_forward(
+        args.duration_ms, args.dt_ms, output,
+        junction_mode=args.junction_mode, junction_root=args.braincell_junction_root,
     )
-    report = run_forward(args.duration_ms, args.dt_ms, output, enable_junctions=not args.no_junctions)
     print(json.dumps(report["simulation"], indent=2, sort_keys=True))
     print(f"Saved traces and summary to {output}.")
 

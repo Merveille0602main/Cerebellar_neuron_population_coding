@@ -30,7 +30,15 @@ import brainunit as u
 import jax.numpy as jnp
 
 from braincell import HHTypedNeuron, Synapse
-from braincell.mech import ScalarEventInput, StateSpec, register_synapse
+from braincell import mech
+from braincell.mech import register_synapse
+
+# The native Junction checkout exposes event and parameter schemas separately.
+if hasattr(mech, "ScalarEventInput"):
+    from braincell.mech import ScalarEventInput, StateSpec
+else:
+    from braincell.event import ScalarEventInput
+    from braincell._parameter_schema import ParameterSpec, StateSpec
 
 
 ArrayLike = Union[brainstate.typing.ArrayLike, Callable]
@@ -64,6 +72,8 @@ class _GranuleGlutamateBase(Synapse):
     """Shared release machinery from the two published MOD mechanisms."""
 
     root_type = HHTypedNeuron
+    if not hasattr(mech, "ScalarEventInput"):
+        parameters = {"temperature_celsius": ParameterSpec(32.0)}
     event_input = ScalarEventInput(u.uS, aggregation="sum")
     states = {name: StateSpec(0.0) for name in ("y", "z", "u_state")}
     history_size = 100

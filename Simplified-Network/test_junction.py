@@ -7,7 +7,8 @@ import brainunit as u
 import numpy as np
 from braincell.filter import at
 
-from junction import Junction, RECORDING, reciprocal_contacts
+from explicit_junction import ExplicitJunction, RECORDING
+from junction import reciprocal_contacts
 
 
 class JunctionTest(unittest.TestCase):
@@ -22,7 +23,9 @@ class JunctionTest(unittest.TestCase):
     def test_network_delivers_equal_and_opposite_current(self):
         soma = bc.Branch.from_lengths(lengths=[20] * u.um, radii=[8, 8] * u.um, type="soma")
         cell = bc.Cell(bc.Morphology.from_root(soma, name="soma"), pop_size=(2,), V_init=-65.0 * u.mV)
-        junction = Junction(np.array([[[0, 0], [1, 0]]]), np.array([[0, 1]]), np.zeros((1, 2), dtype=int))
+        junction = ExplicitJunction(
+            np.array([[[0, 0], [1, 0]]]), np.array([[0, 1]]), np.zeros((1, 2), dtype=int)
+        )
         junction._place(cell, [[at("soma", 0.5), at("soma", 0.5)]])
         net = bc.Network("passive_pair")
         net.add_population("golgi", cell)

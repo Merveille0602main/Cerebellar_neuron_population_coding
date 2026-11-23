@@ -1,0 +1,85 @@
+{
+  "chemical_conductance_peak_change_nS": {
+    "ascending_axon_to_golgi_ampa": 0.0,
+    "ascending_axon_to_golgi_nmda": 0.0,
+    "glomerulus_to_golgi_ampa": 0.0,
+    "glomerulus_to_golgi_nmda": 0.0,
+    "glomerulus_to_granule_ampa": 0.0,
+    "glomerulus_to_granule_nmda": 0.0,
+    "golgi_to_golgi_gaba": 0.0,
+    "golgi_to_granule_gaba": 0.0,
+    "parallel_fiber_to_golgi_ampa": 0.0
+  },
+  "junction": {
+    "anatomical_contacts": 74,
+    "conductance_nS_per_contact": 1.0,
+    "contacts_with_nonzero_current": 37,
+    "integration": "explicit_start_of_step_point_voltage",
+    "intercellular_contacts": 25,
+    "intracellular_contacts": 12,
+    "max_pair_residual_pA": 0.0,
+    "peak_absolute_pA": 64.46669006347656,
+    "physical_contacts": 37,
+    "runtime_electrical_coupling": true,
+    "same_electrical_point_contacts": 0
+  },
+  "matched_run_settings": {
+    "chemical_event_rows": 7521,
+    "dt_ms": 0.05,
+    "duration_ms": 18.0,
+    "steps": 360,
+    "stimulus": {
+      "kind": "synchronous_mossy_burst",
+      "times_ms": [
+        0.25,
+        0.65,
+        1.05,
+        1.45,
+        1.85,
+        2.25,
+        2.65,
+        3.05,
+        3.45,
+        3.85,
+        4.25,
+        4.65,
+        5.05,
+        5.45,
+        5.85,
+        6.25,
+        6.65,
+        7.05,
+        7.45,
+        7.85
+      ]
+    }
+  },
+  "populations": {
+    "golgi_cell": {
+      "cells_firing_after": 11,
+      "cells_firing_before": 11,
+      "max_absolute_paired_spike_shift_ms": 1.6499996185302734,
+      "max_absolute_voltage_difference_mV": 75.46702194213867,
+      "max_difference_source_id": 15,
+      "max_difference_time_ms": 15.600000381469727,
+      "paired_spikes_in_cells_with_unchanged_count": 19,
+      "somatic_spikes_after": 19,
+      "somatic_spikes_before": 19,
+      "source_ids_with_changed_spike_count": [],
+      "voltage_rms_difference_mV": 6.835788004287583
+    },
+    "granule_cell": {
+      "cells_firing_after": 256,
+      "cells_firing_before": 256,
+      "max_absolute_paired_spike_shift_ms": 0.0,
+      "max_absolute_voltage_difference_mV": 11.747762680053711,
+      "max_difference_source_id": 21930,
+      "max_difference_time_ms": 17.55000114440918,
+      "paired_spikes_in_cells_with_unchanged_count": 256,
+      "somatic_spikes_after": 256,
+      "somatic_spikes_before": 256,
+      "source_ids_with_changed_spike_count": [],
+      "voltage_rms_difference_mV": 0.20040101636005025
+    }
+  }
+}

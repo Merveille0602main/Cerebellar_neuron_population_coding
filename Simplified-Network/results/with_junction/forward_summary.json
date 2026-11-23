@@ -1,0 +1,185 @@
+{
+  "ascending_axon_ampa": "Masoli et al. (2020) ModelDB 266806 syn_AA2GoC_det substitute",
+  "braincell_version": "0.2.0",
+  "control_volumes_per_cell": {
+    "golgi_cell": 317,
+    "granule_cell": 114
+  },
+  "diagnostic_current_clamps": false,
+  "excluded": {
+    "golgi_to_glomerulus": "structural scaffold relation; feedback is on golgi_to_granule"
+  },
+  "golgi_to_golgi_gaba": "DBBS alpha1 kinetics with 3200 pS nominal gmax from De Schepper et al. (2022)",
+  "morphology_branches_per_cell": {
+    "golgi_cell": 227,
+    "granule_cell": 108
+  },
+  "mossy_to_glomerulus": "published device relay expanded to a fixed event table",
+  "population_counts": {
+    "glomerulus": 2336,
+    "golgi_cell": 12,
+    "granule_cell": 256,
+    "mossy_fibers": 117
+  },
+  "receiver_mode": "contact",
+  "routes": {
+    "ascending_axon_to_golgi": {
+      "anatomical_contacts": 37,
+      "mechanisms": {
+        "ampa": {
+          "event_rows": 37,
+          "receivers": 37
+        },
+        "nmda": {
+          "event_rows": 37,
+          "receivers": 37
+        }
+      }
+    },
+    "gap_goc": {
+      "anatomical_contacts": 74,
+      "conductance_nS_per_contact": 1.0,
+      "integration": "explicit_start_of_step_point_voltage",
+      "intercellular_contacts": 25,
+      "intracellular_contacts": 12,
+      "physical_contacts": 37,
+      "runtime_electrical_coupling": true,
+      "same_electrical_point_contacts": 0
+    },
+    "glomerulus_to_golgi": {
+      "anatomical_contacts": 631,
+      "mechanisms": {
+        "ampa": {
+          "event_rows": 631,
+          "receivers": 631
+        },
+        "nmda": {
+          "event_rows": 631,
+          "receivers": 631
+        }
+      }
+    },
+    "glomerulus_to_granule": {
+      "anatomical_contacts": 1024,
+      "mechanisms": {
+        "ampa": {
+          "event_rows": 1024,
+          "receivers": 1024
+        },
+        "nmda": {
+          "event_rows": 1024,
+          "receivers": 1024
+        }
+      }
+    },
+    "golgi_to_golgi": {
+      "anatomical_contacts": 3870,
+      "mechanisms": {
+        "gaba": {
+          "event_rows": 3870,
+          "receivers": 3870
+        }
+      }
+    },
+    "golgi_to_granule": {
+      "anatomical_contacts": 170,
+      "mechanisms": {
+        "gaba": {
+          "event_rows": 170,
+          "receivers": 170
+        }
+      }
+    },
+    "mossy_to_glomerulus": {
+      "anatomical_contacts": 2336
+    },
+    "parallel_fiber_to_golgi": {
+      "anatomical_contacts": 97,
+      "mechanisms": {
+        "ampa": {
+          "event_rows": 97,
+          "receivers": 97
+        }
+      }
+    }
+  },
+  "selected_global_ids": null,
+  "selection": "seed_318_simplified_network",
+  "simulation": {
+    "build_seconds": 29.44,
+    "chemical_event_rows": 7521,
+    "dt_ms": 0.05,
+    "duration_ms": 18.0,
+    "event_counts": {
+      "glomerulus": {
+        "event": 46720
+      },
+      "golgi_cell": {
+        "golgi_to_golgi_axon": 1045,
+        "golgi_to_granule_axon": 1237,
+        "spike": 19
+      },
+      "granule_cell": {
+        "ascending_axon_to_golgi_axon": 767,
+        "parallel_fiber_to_golgi_axon": 12182,
+        "spike": 256
+      },
+      "mossy_fibers": {
+        "event": 2340
+      }
+    },
+    "junction_current": {
+      "contacts_with_nonzero_current": 37,
+      "max_pair_residual_pA": 0.0,
+      "peak_absolute_pA": 64.46669006347656
+    },
+    "peak_synaptic_conductance_nS": {
+      "ascending_axon_to_golgi_ampa": 0.5363994836807251,
+      "ascending_axon_to_golgi_nmda": 0.39502227306365967,
+      "glomerulus_to_golgi_ampa": 0.7090258002281189,
+      "glomerulus_to_golgi_nmda": 0.5582082271575928,
+      "glomerulus_to_granule_ampa": 0.7101752161979675,
+      "glomerulus_to_granule_nmda": 0.5582178235054016,
+      "golgi_to_golgi_gaba": 0.7476046085357666,
+      "golgi_to_granule_gaba": 0.28450819849967957,
+      "parallel_fiber_to_golgi_ampa": 0.5364412069320679
+    },
+    "run_seconds_including_initialization_and_compilation": 530.247,
+    "somatic_voltage_range_mV": {
+      "golgi_cell": [
+        -65.08863830566406,
+        21.283428192138672
+      ],
+      "granule_cell": [
+        -65.0,
+        46.48558807373047
+      ]
+    },
+    "steps": 360,
+    "stimulus": {
+      "kind": "synchronous_mossy_burst",
+      "times_ms": [
+        0.25,
+        0.65,
+        1.05,
+        1.45,
+        1.85,
+        2.25,
+        2.65,
+        3.05,
+        3.45,
+        3.85,
+        4.25,
+        4.65,
+        5.05,
+        5.45,
+        5.85,
+        6.25,
+        6.65,
+        7.05,
+        7.45,
+        7.85
+      ]
+    }
+  }
+}

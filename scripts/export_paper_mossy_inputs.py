@@ -14,7 +14,7 @@ from cerebellar_reproduction import build_paper_mossy_input_schedule
 
 
 ROOT = Path(__file__).parents[1]
-DEFAULT_CONFIG = ROOT.parent / "deschepper-etal-2022-source/configs/balanced.json"
+DEFAULT_CONFIG = ROOT / "data/reference/balanced.json"
 
 
 def main() -> None:

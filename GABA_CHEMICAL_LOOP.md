@@ -81,8 +81,7 @@ GoC 24 → GrC 4130: 1 edge, 2 contacts, target compartments 120/129
 运行命令：
 
 ```bash
-PYTHONPATH=src:/home/merveille/copneuron/braincell \
-  .venv/bin/python scripts/run_granular_layer_chemical_subnetwork.py
+.venv/bin/python scripts/run_granular_layer_chemical_subnetwork.py
 ```
 
 ## 5. 当前边界

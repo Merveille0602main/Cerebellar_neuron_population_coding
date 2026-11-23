@@ -8,34 +8,36 @@
 
 `gap_goc.npz` 的 **74 行有向记录**来自原模型的镜像处理。按原始细胞 ID 和形态位置配对后得到 **37 个双端接触**，其中 25 个跨两个 Golgi，12 个连接同一 Golgi 的两个不同形态位置。每个物理接触统一采用 DBBS 并行缝隙连接机制的默认电导 **1 nS**。 [原模型配置](https://github.com/Helveg/deschepper-etal-2022-source/blob/897eb74e942ce64a90b67090cae0da7e467978f8/configs/balanced.json) · [DBBS 并行 gap junction 源码](https://github.com/dbbs-lab/dbbs-mod-collection/blob/f896c16f963042331a481a07a03240e4cc059f2c/dbbs_mod_collection/mod/glia__dbbs_mod_collection__gap_junction__parallel.mod)
 
-默认的[原生 Junction 接线](junction.py)从 `/home/merveille/copneuron/braincell-junction` 加载 BrainCell。接线保留原始两端的细胞与形态位置，用 `Network.connect_junction()` 注册双端 `mech.Junction`。每个接触端点绑定到其所在的计算房室。原生求解器在同一个隐式步骤中联立轴向电流、膜电流和缝隙连接，得到相互耦合的 Golgi 膜电压。
+默认的[原生 Junction 接线](junction.py)使用装在项目虚拟环境中的[内置 BrainCell](../vendor/braincell/README.md)。接线保留原始两端的细胞与形态位置，用 `Network.connect_junction()` 注册双端 `mech.Junction`。每个接触端点绑定到其所在的计算房室。原生求解器在同一个隐式步骤中联立轴向电流、膜电流和缝隙连接，得到相互耦合的 Golgi 膜电压。
 
 [历史显式耦合版](explicit_junction.py)使用发布版 BrainCell 0.2.0。它从每步起始的形态电节点电压计算等量反向的电流，并在本步内将其作为恒定点电流注入两端。两种模式使用相同的解剖接触和电导。离散化后，落到同一细胞同一电节点的两端之间没有电压差。
 
 ## 运行
 
-在 WSL 的 Git 仓库中进入 `Simplified-Network`，运行以下命令。安装父项目会安装子网共用的细胞与化学突触代码，以及用来重现旧结果的 BrainCell 0.2.0。默认模式从指定的本地工作树导入原生 BrainCell，可用 `--braincell-junction-root` 指向其他位置。目录自带接线、形态映射和细胞模板，运行时直接读取子网数据。
+按[项目首页](../README.md#快速运行)在仓库根目录创建并激活环境。以下命令也从仓库根目录运行。目录自带接线、形态映射和细胞模板。
 
 ```bash
-python -m pip install -e '..[braincell-runtime]'
-JAX_PLATFORMS=cpu python run_forward.py
-python compare_forward.py
+JAX_PLATFORMS=cpu python Simplified-Network/run_forward.py
+python Simplified-Network/compare_forward.py \
+  --native Simplified-Network/runs/with_native_junction \
+  --output Simplified-Network/runs/native_junction_comparison.json
 ```
 
-默认模拟 18 毫秒，步长 0.05 毫秒，沿用原基线的同步苔藓纤维刺激。可用 `--duration-ms`、`--dt-ms` 和 `--output` 修改时长、步长和结果目录。[原生结果摘要](results/with_native_junction/forward_summary.json)记录了工作树路径、Git HEAD 和实际运行的 Python 源码指纹。本次工作树含有尚未提交的原生 Junction 实现。精确复跑需要同一份工作树源码。
+默认模拟 18 毫秒，步长 0.05 毫秒，沿用原基线的同步苔藓纤维刺激。可用 `--duration-ms`、`--dt-ms` 和 `--output` 修改时长、步长和结果目录。新运行写入 `runs/`，并记录内置 BrainCell 的版本与源码指纹。
 
-下面的命令使用发布版 BrainCell 0.2.0，将显式耦合和无耦合两组复跑结果写到新目录。若只拷贝本目录来重跑这两种历史模式，可以用 `python -m pip install -r requirements.txt` 安装历史运行代码。
+同一内置环境支持 `--junction-mode off`，便于在相同内核下切换电耦合。下面的命令用独立环境复跑两组基于发布版 BrainCell 0.2.0 的历史对照。
 
 ```bash
-JAX_PLATFORMS=cpu python run_forward.py --junction-mode explicit --output results/explicit_rerun
-JAX_PLATFORMS=cpu python run_forward.py --junction-mode off --output results/without_junction
-python compare_forward.py --baseline results/without_junction --explicit results/explicit_rerun
+python3.13 -m venv .venv-braincell-archive
+.venv-braincell-archive/bin/python -m pip install -c requirements-cpu.txt . braincell==0.2.0
+JAX_PLATFORMS=cpu .venv-braincell-archive/bin/python Simplified-Network/run_forward.py --junction-mode explicit
+JAX_PLATFORMS=cpu .venv-braincell-archive/bin/python Simplified-Network/run_forward.py --junction-mode off
 ```
 
 如需重新提取，传入发布数据的原文件。
 
 ```bash
-python extract.py ../data/reference/balanced.hdf5
+python Simplified-Network/extract.py data/reference/balanced.hdf5
 ```
 
 ## 输出
@@ -49,6 +51,8 @@ python extract.py ../data/reference/balanced.hdf5
 ## 本机验证
 
 三组均在 WSL CPU 上运行 360 步，收到 2,340 条苔藓纤维事件和 46,720 条小球事件。268 个胞体的电压记录均为有限值，九种按通路记录的受体电导峰值均大于零。每组中 256 个颗粒细胞各发放一次，12 个 Golgi 中有 11 个发放，共 19 次胞体发放。每个细胞的发放次数在三组中一致。
+
+内置 BrainCell 安装到新的虚拟环境后，用同样的刺激与步长重跑 18 毫秒。胞体电压、发放、Junction 端点电压和电流数组都与原生版归档逐项一致。
 
 | 运行 | 整个前向进程耗时 | 峰值常驻内存 | 有非零电流的 Junction 接触 | 单端最大绝对电流 |
 | --- | ---: | ---: | ---: | ---: |
@@ -67,4 +71,4 @@ python extract.py ../data/reference/balanced.hdf5
 
 电压差按同一细胞、同一时间步计算，动作电位的时间偏移也会反映在瞬时电压差上。原生版与两组历史结果使用不同的 BrainCell 运行代码。原生端点取所在房室电压，显式端点取形态电节点电压。对照反映了这些差异与积分方式的共同影响。两组电流峰值分别取自步末端点电压重建值和步初注入电流。 [完整对比数据](results/native_junction_comparison.json)
 
-在 BrainCell 0.2.0 中运行 `python -m unittest -v test_junction` 可核对镜像配对、并联接触和显式双向电流。本次还运行了原生工作树中的 `braincell.network.engine_test`，其中的双端耦合测试涵盖跨细胞、同细胞不同房室和与直接联立求解的数值对照。
+在项目环境运行 `python -m unittest -v braincell.network.engine_test` 可核对跨细胞耦合、同细胞不同房室的耦合，以及与直接联立求解的数值对照。在历史环境进入本目录运行 `python -m unittest -v test_junction` 可核对镜像配对、并联接触和显式电流。

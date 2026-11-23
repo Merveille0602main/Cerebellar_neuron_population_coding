@@ -1,0 +1,31 @@
+# CPU environment verified on Linux x86-64 with CPython 3.13.
+# Install the bundled BrainCell and reproduction project with these constraints.
+absl-py==2.5.1
+array-api-compat==1.16.0
+brainevent==0.4.2
+brainpy==2.9.0
+brainstate==0.6.1
+braintools==0.5.0
+brainunit==0.6.0
+contourpy==1.4.0
+cycler==0.12.1
+fonttools==4.68.0
+h5py==3.16.0
+jax==0.12.1
+jaxlib==0.12.1
+kiwisolver==1.5.1
+matplotlib==3.11.2
+ml-dtypes==0.7.0
+msgpack==1.2.4
+numpy==2.5.5
+opt-einsum==3.4.0
+optax==0.2.9
+packaging==26.3
+pillow==13.0.0
+pyparsing==3.3.3
+python-dateutil==4.0.0
+saiunit==0.6.0
+scipy==1.18.1
+tqdm==4.70.1
+typing-extensions==4.16.0
+tzdata==2026.6

@@ -1,0 +1,8 @@
+# Keep bundled Python source fingerprints consistent across checkouts.
+/vendor/braincell/braincell/**/*.py text eol=lf
+
+# Preserve the formatting and source bytes of the imported NEURON and ASC fixtures.
+/assets/braincell/examples/neuron_compare/Cerebellum_mod/**/*.mod -text -whitespace
+/assets/braincell/examples/neuron_compare/Cerebellum_mod/GrC/morphology/GrC.asc -text -whitespace
+/Simplified-Network/assets/braincell/examples/neuron_compare/Cerebellum_mod/GrC/morphology/GrC.asc -text -whitespace
+/vendor/braincell/examples/neuron_compare/Cerebellum_mod/**/*.mod -text -whitespace

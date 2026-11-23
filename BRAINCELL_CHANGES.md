@@ -2,7 +2,7 @@
 
 ## 1. 文档目的与代码边界
 
-本文记录小脑论文复现过程中对共享仓库 `/home/merveille/copneuron/braincell` 所做的修改。复现实验、数据转换、基准脚本和论文专用机制仍位于独立目录 `/home/merveille/copneuron/braincell-cerebellar-reproduction`；只有可复用的网络运行能力被修改在 BrainCell 中。
+本文记录小脑论文复现早期在独立 BrainCell 工作树中完成的网络运行改动。当前运行环境见 [环境说明](ENVIRONMENT.md)。
 
 记录日期：2026-08-08。BrainCell 当前基准提交为 `c803e77`。
 
@@ -105,7 +105,7 @@ presynaptic spike 被安排在第一块边界，使其延迟投递必须跨块�
 BrainCell 网络运行回归：
 
 ```bash
-cd /home/merveille/copneuron/braincell
+cd path/to/historical-braincell-checkout
 pytest braincell/network/runtime_test.py
 ```
 
@@ -114,8 +114,7 @@ pytest braincell/network/runtime_test.py
 复现项目回归：
 
 ```bash
-cd /home/merveille/copneuron/braincell-cerebellar-reproduction
-PYTHONPATH=src:/home/merveille/copneuron/braincell .venv/bin/pytest
+.venv/bin/pytest
 ```
 
 结果：14 个测试通过。真实 GrC 分块测试验证拼接后的胞体电压、AMPA/NMDA 电导和 glomerulus spikes 与连续运行一致。
@@ -174,8 +173,7 @@ PYTHONPATH=src:/home/merveille/copneuron/braincell .venv/bin/pytest
 最新聚焦回归：
 
 ```bash
-PYTHONPATH=src:/home/merveille/copneuron/braincell \
-  .venv/bin/pytest -q tests/test_paper_synapses.py tests/test_runnable_subnetwork.py
+.venv/bin/pytest -q tests/test_paper_synapses.py tests/test_runnable_subnetwork.py
 ```
 
 结果：10 个测试通过。

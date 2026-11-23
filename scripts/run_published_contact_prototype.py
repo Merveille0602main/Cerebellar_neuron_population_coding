@@ -37,7 +37,7 @@ def main() -> None:
         "braincell_repo",
         type=Path,
         nargs="?",
-        default=ROOT.parent / "braincell",
+        default=ROOT / "assets/braincell",
     )
     parser.add_argument("--duration-ms", type=float, default=2.0)
     args = parser.parse_args()

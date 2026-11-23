@@ -8,8 +8,6 @@ from hashlib import sha256
 from inspect import signature
 import json
 from pathlib import Path
-import subprocess
-import sys
 from time import perf_counter
 
 import brainunit as u
@@ -19,7 +17,6 @@ from junction import CONDUCTANCE_NS, CV_VOLTAGE_RECORDING, NativeJunction
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_JUNCTION_ROOT = Path("/home/merveille/copneuron/braincell-junction")
 RESULT_FOLDERS = {"native": "with_native_junction", "explicit": "with_junction", "off": "without_junction"}
 
 
@@ -34,38 +31,28 @@ def _runtime_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_braincell(mode: str, junction_root: Path):
-    if mode == "native":
-        junction_root = junction_root.expanduser().resolve()
-        entry = junction_root / "braincell/__init__.py"
-        if not entry.is_file():
-            raise FileNotFoundError(f"BrainCell Junction worktree not found at {junction_root}.")
-        digest = _runtime_digest(junction_root)
-        sys.path.insert(0, str(junction_root))
-
+def _load_braincell(mode: str):
     import braincell as bc
 
-    if mode != "native":
-        if bc.__version__ != "0.2.0":
-            raise RuntimeError("The archived explicit and uncoupled modes use the BrainCell 0.2.0 wheel.")
+    if bc.__version__ == "0.2.0" and mode != "native":
         return bc, {"source": "pypi_release", "version": bc.__version__}
-    if Path(bc.__file__).resolve() != entry or not hasattr(bc.Network, "connect_junction"):
-        raise RuntimeError(f"Expected the native Junction API from {junction_root}; loaded {bc.__file__}.")
-    revision = subprocess.check_output(["git", "-C", str(junction_root), "rev-parse", "HEAD"], text=True).strip()
+    if mode == "explicit":
+        raise RuntimeError("The historical explicit mode requires the released BrainCell 0.2.0 environment.")
+    if "+reproduction." not in bc.__version__ or not hasattr(bc.Network, "connect_junction"):
+        raise RuntimeError("Install the BrainCell runtime bundled in vendor/braincell as shown in the README.")
+    package_root = Path(bc.__file__).resolve().parent.parent
     return bc, {
-        "source": "local_native_junction_worktree",
+        "source": "reproduction_bundled",
         "version": bc.__version__,
-        "worktree": str(junction_root),
-        "git_head": revision,
-        "runtime_python_sha256": digest,
+        "runtime_python_sha256": _runtime_digest(package_root),
     }
 
 
 def run_forward(
     duration_ms: float, dt_ms: float, output: Path, *,
-    junction_mode: str = "native", junction_root: Path = DEFAULT_JUNCTION_ROOT,
+    junction_mode: str = "native",
 ) -> dict:
-    bc, runtime = _load_braincell(junction_mode, junction_root)
+    bc, runtime = _load_braincell(junction_mode)
     from cerebellar_reproduction.granular_layer import GOC, GRC, MF, ROUTES, build_granular_layer
     from cerebellar_reproduction.validation import validate_export
 
@@ -121,8 +108,6 @@ def run_forward(
     started = perf_counter()
     result = network.run(dt=dt_ms * u.ms, duration=duration_ms * u.ms)
     simulation_seconds = perf_counter() - started
-    if junction_mode == "native" and _runtime_digest(Path(runtime["worktree"])) != runtime["runtime_python_sha256"]:
-        raise RuntimeError("The native BrainCell runtime sources changed during this forward run.")
 
     arrays = {}
     junction_current = None
@@ -204,16 +189,12 @@ def main() -> None:
     modes.add_argument("--junction-mode", choices=tuple(RESULT_FOLDERS), default="native")
     modes.add_argument("--no-junctions", dest="junction_mode", action="store_const", const="off",
                        help="reproduce the uncoupled baseline")
-    parser.add_argument("--braincell-junction-root", type=Path, default=DEFAULT_JUNCTION_ROOT)
-    parser.add_argument("--output", type=Path, help="default: results/<selected-mode folder>")
+    parser.add_argument("--output", type=Path, help="default: runs/<selected-mode folder>")
     args = parser.parse_args()
     if not (np.isfinite(args.dt_ms) and np.isfinite(args.duration_ms) and 0 < args.dt_ms <= args.duration_ms):
         parser.error("Require a finite duration at least as long as one positive integration step.")
-    output = args.output if args.output is not None else ROOT / "results" / RESULT_FOLDERS[args.junction_mode]
-    report = run_forward(
-        args.duration_ms, args.dt_ms, output,
-        junction_mode=args.junction_mode, junction_root=args.braincell_junction_root,
-    )
+    output = args.output if args.output is not None else ROOT / "runs" / RESULT_FOLDERS[args.junction_mode]
+    report = run_forward(args.duration_ms, args.dt_ms, output, junction_mode=args.junction_mode)
     print(json.dumps(report["simulation"], indent=2, sort_keys=True))
     print(f"Saved traces and summary to {output}.")
 

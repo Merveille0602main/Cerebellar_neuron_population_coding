@@ -3,10 +3,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+bc = pytest.importorskip("braincell")
+pytestmark = pytest.mark.skipif(not hasattr(bc.Network, "add_projection"), reason="requires the legacy projection API")
+
 
 ROOT = Path(__file__).parents[1]
 SOURCE = ROOT / "data/reference/balanced.hdf5"
-BRAINCELL = ROOT.parent / "braincell"
+BRAINCELL = ROOT / "assets/braincell"
 
 
 @pytest.mark.skipif(not SOURCE.exists() or not BRAINCELL.exists(), reason="integration data unavailable")

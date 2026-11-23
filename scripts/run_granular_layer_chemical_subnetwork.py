@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build or simulate the granular layer with the official BrainCell 0.2 API."""
+"""Build or simulate the granular layer with the installed BrainCell runtime."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def main() -> None:
     parser.add_argument("--source-hdf5", type=Path, default=ROOT / "data/reference/balanced.hdf5")
     parser.add_argument(
         "--braincell-repo", type=Path,
-        default=BUNDLED_ASSETS if BUNDLED_ASSETS.is_dir() else ROOT.parent / "braincell",
+        default=BUNDLED_ASSETS,
         help="override the bundled BrainCell morphology and cell templates",
     )
     parser.add_argument("--full", action="store_true", help="retain every published granular-layer cell and contact")

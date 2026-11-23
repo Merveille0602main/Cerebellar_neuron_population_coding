@@ -27,7 +27,7 @@ def main() -> None:
         type=Path,
         default=ROOT / "data/reference/balanced.hdf5",
     )
-    parser.add_argument("--braincell-repo", type=Path, default=ROOT.parent / "braincell")
+    parser.add_argument("--braincell-repo", type=Path, default=ROOT / "assets/braincell")
     parser.add_argument("--mossy-ids", type=int, nargs="+", default=[213, 214])
     parser.add_argument(
         "--spike-times-ms",

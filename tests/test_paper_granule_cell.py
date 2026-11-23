@@ -5,11 +5,11 @@ import numpy as np
 import pytest
 
 
-BRAINCELL = Path(__file__).resolve().parents[2] / "braincell"
+pytest.importorskip("braincell")
+BRAINCELL = Path(__file__).resolve().parents[1] / "assets/braincell"
 sys.path.append(str(BRAINCELL))
 
 
-@pytest.mark.skipif(not BRAINCELL.exists(), reason="BrainCell checkout unavailable")
 def test_paper_granule_morphology_matches_historical_builder():
     import brainunit as u
 

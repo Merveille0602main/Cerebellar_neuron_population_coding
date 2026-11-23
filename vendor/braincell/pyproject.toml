@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "braincell"
+dynamic = ["version"]
+description = "BrainCell runtime bundled with the cerebellar reproduction"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{name = "BrainCell Developers", email = "chao.brain@qq.com"}]
+dependencies = [
+  "brainevent>=0.0.7",
+  "brainpy>=2.7.5",
+  "brainstate>=0.5.4",
+  "braintools>=0.1",
+  "brainunit>=0.0.8",
+  "jax",
+  "numpy>=2",
+  "scipy",
+]
+
+[project.urls]
+"Upstream" = "https://github.com/chaobrain/braincell"
+"Reproduction" = "https://github.com/Merveille0602main/Cerebellar_neuron_population_coding"
+
+[tool.setuptools.packages.find]
+include = ["braincell", "braincell.*"]
+
+[tool.setuptools.package-data]
+braincell = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = {attr = "braincell._version.__version__"}

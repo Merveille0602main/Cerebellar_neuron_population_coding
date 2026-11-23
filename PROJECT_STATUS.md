@@ -23,7 +23,9 @@ NEURON + dbbs_models：实例化细胞/突触机制、施加输入、时间积�
 
 ## 1. 论文从网络搭建到实验的完整流程
 
-论文复现仓库：`/home/merveille/copneuron/deschepper-etal-2022-source`。基础网络配置为 `configs/balanced.json`；已构建的发布网络为 `balanced.hdf5`。论文 Methods 将流程概括为三个可迭代阶段：**configuration → reconstruction → simulation**，之后进行数据分析和可视化。
+论文复现仓库为 De Schepper 等发布的源码。 [论文源码](https://github.com/Helveg/deschepper-etal-2022-source)
+
+基础网络配置为 `configs/balanced.json`；已构建的发布网络为 `balanced.hdf5`。论文 Methods 将流程概括为三个可迭代阶段：**configuration → reconstruction → simulation**，之后进行数据分析和可视化。
 
 ### 1.1 BSB 网络搭建的完整流程
 
@@ -249,7 +251,7 @@ BrainCell 的 Population + EdgeSet
 
 ### 4.1 已完成
 
-项目目录：`/home/merveille/copneuron/braincell-cerebellar-reproduction`。
+项目目录为本仓库根目录。
 
 #### A. 固定并验证论文发布网络
 

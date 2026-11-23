@@ -31,10 +31,12 @@ BrainCell 现新增 `Network.run_chunks(...)`：所有块共享一个 delivery s
 命令：
 
 ```bash
-PYTHONPATH=src:/home/merveille/copneuron/braincell \
-  .venv/bin/python scripts/benchmark_mossy_pathway.py \
+.venv/bin/python scripts/benchmark_mossy_pathway.py \
+  --config data/reference/balanced.json \
   --duration-ms 10000 --chunk-duration-ms 1000
 ```
+
+刺激配置取自论文发布的 [balanced.json](https://github.com/Helveg/deschepper-etal-2022-source/blob/897eb74e942ce64a90b67090cae0da7e467978f8/configs/balanced.json)。
 
 环境：AMD Ryzen 9 8940HX（16 cores/32 threads）、CPU JAX、Python 3.13.11、JAX 0.11.0、BrainState 0.5.3、BrainUnit 0.5.2。
 

@@ -114,8 +114,8 @@ def compare(baseline: Path, explicit: Path, native: Path) -> dict:
         name: summary.get("braincell_runtime", {"source": "pypi_release", "version": summary["braincell_version"]})
         for name, summary in summaries.items()
     }
-    if runtimes["native"]["source"] != "local_native_junction_worktree":
-        raise ValueError("The native result must come from the local BrainCell Junction worktree.")
+    if runtimes["native"]["source"] not in {"local_native_junction_worktree", "reproduction_bundled"}:
+        raise ValueError("The native result must use a verified BrainCell Junction runtime.")
     simulations = {name: summary["simulation"] for name, summary in summaries.items()}
     pairs = (("baseline", "explicit"), ("baseline", "native"), ("explicit", "native"))
     with ExitStack() as stack:

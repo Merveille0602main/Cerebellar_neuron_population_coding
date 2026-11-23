@@ -1,0 +1,38 @@
+{
+  "meta": {
+    "label": "GoC Cav2p3 MA20",
+    "note": "The MA2020 GoC soma carries no Cav2.3 (parameters.py leaves the field at 0.0, so a zero conductance made this config compare nothing: current was identically 0). The value below is the fitted apical-dendrite density from Optimization_result.txt (values[3] = 1.28859564935e-03) and is used here only as a parity comparison scale, not as a somatic model parameter."
+  },
+  "identity": {
+    "mod_dir": "../../../Cerebellum_mod/GoC/channel"
+  },
+  "defaults": {
+    "channel_params": {
+      "g_max_S_cm2": 0.00128859564935
+    }
+  },
+  "mapping": {
+    "current": "ica",
+    "impl_name": {
+      "neuron": "Cav2p3_MA20_GoC",
+      "braincell": "Cav2p3_MA2020_GoC"
+    },
+    "gate_names": {
+      "common": [
+        "m",
+        "h"
+      ]
+    },
+    "channel_params": {
+      "g_max_S_cm2": {
+        "neuron": "gcabar",
+        "braincell": "g_max"
+      }
+    }
+  },
+  "templates": [
+    "../../templates/vinit_celsius.json",
+    "../../templates/dc.json",
+    "../../templates/ac.json"
+  ]
+}

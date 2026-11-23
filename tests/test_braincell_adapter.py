@@ -5,6 +5,10 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
+
+bc = pytest.importorskip("braincell")
+pytestmark = pytest.mark.skipif(not hasattr(bc.Network, "add_edges"), reason="requires the legacy edge-set API")
 
 from cerebellar_reproduction.braincell_adapter import (
     add_edge_sets,
@@ -58,7 +62,7 @@ def test_lowers_exported_edges_to_braincell(tmp_path):
 
 def test_mapped_granule_compartments_form_a_real_synapse_pool():
     root = Path(__file__).parents[1]
-    braincell_repo = root.parent / "braincell"
+    braincell_repo = root / "assets/braincell"
     if not braincell_repo.exists():
         return
     if str(braincell_repo) not in sys.path:

@@ -135,7 +135,7 @@ exact-geometry 算法映射发布 HDF5 contacts。该问题暂不影响当前 Gr
 
 ## 6. 可复核来源
 
-- 论文网络配置：`/home/merveille/copneuron/deschepper-etal-2022-source/configs/balanced.json`
+- [论文网络配置](https://github.com/Helveg/deschepper-etal-2022-source/blob/897eb74e942ce64a90b67090cae0da7e467978f8/configs/balanced.json)
 - paper-era `dbbs_models`：v1.1.2，提交 `5f920d5`
 - GABA 对应 `dbbs_mod_collection`：提交 `8d21c4a4f888f19a6531224f1eb08d6c833c44e5`
 - GABA 源 SHA-256：`f99a72c520860e01d77ca2d34b4f7bade4796a65b6abcb5c6f88f5d79695bfae`

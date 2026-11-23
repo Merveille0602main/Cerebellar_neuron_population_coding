@@ -7,3 +7,8 @@ data/export/
 
 .venv-braincell-*/
 *.egg-info/
+/build/
+/vendor/braincell/build/
+/vendor/braincell/examples/neuron_compare/Cerebellum_mod/**/x86_64/
+/vendor/braincell/examples/neuron_compare/Cerebellum_mod/**/arm64/
+/Simplified-Network/runs/

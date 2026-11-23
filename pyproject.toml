@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-braincell-runtime = ["braincell==0.2.0"]
+braincell-runtime = ["braincell==0.1.0+reproduction.1"]
 neuron-validation = [
   "neuron==9.0.2",
 ]

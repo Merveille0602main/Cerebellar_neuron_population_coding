@@ -1,6 +1,6 @@
 # 与原始 BSB / NEURON 网络的对齐情况
 
-原始参考为 De Schepper 等（2022）的 `balanced.hdf5` 与历史 BSB、Arborize 和 DBBS 模型。BrainCell 0.2.0 保留了所选颗粒层通路的发布细胞 ID、连接记录与形态位置。全柱结构见 [交互式结构图](network-structure.html)。 [原论文](https://doi.org/10.1038/s42003-022-04213-y) · [网络配置](https://github.com/Helveg/deschepper-etal-2022-source/blob/897eb74e942ce64a90b67090cae0da7e467978f8/configs/balanced.json)
+原始参考为 De Schepper 等（2022）的 `balanced.hdf5` 与历史 BSB、Arborize 和 DBBS 模型。本项目保留了所选颗粒层通路的发布细胞 ID、连接记录与形态位置。全柱结构见 [交互式结构图](network-structure.html)。 [原论文](https://doi.org/10.1038/s42003-022-04213-y) · [网络配置](https://github.com/Helveg/deschepper-etal-2022-source/blob/897eb74e942ce64a90b67090cae0da7e467978f8/configs/balanced.json)
 
 ## 树突和计算房室
 
@@ -25,7 +25,7 @@ BSB 用于记录接触位置的形态线段是相邻形态采样点之间的区�
 
 ### Gap junction
 
-`gap_goc` 保留 **2,082 条**发布接触记录，包括两端的 Golgi 细胞 ID 及基底树突位置，其中 114 条记录的两端属于同一细胞。全量形态检查会解析两端。当前运行器未接入双端电流与电压耦合，因此这些记录不会生成运行时电连接。原论文的 Golgi 电同步与颗粒层振荡不能据此复现。 [发布数据](https://doi.org/10.5281/zenodo.7230288) · [原论文图 3 和图 4](https://doi.org/10.1038/s42003-022-04213-y)
+`gap_goc` 保留 **2,082 条**发布接触记录，包括两端的 Golgi 细胞 ID 及基底树突位置，其中 114 条记录的两端属于同一细胞。全量入口检查并保留两端形态位置。256 颗粒细胞与 12 Golgi 子网用内置 BrainCell 求解器启用 37 个双端接触。原论文全网的 Golgi 电同步和颗粒层振荡仍需用全网刺激和统计量对照。 [子网 Junction](../Simplified-Network/README.md#junction-电耦合) · [原论文图 3 和图 4](https://doi.org/10.1038/s42003-022-04213-y)
 
 ## 其余范围
 

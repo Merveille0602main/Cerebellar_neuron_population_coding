@@ -30,7 +30,7 @@ def main() -> None:
     parser.add_argument(
         "--braincell-repo",
         type=Path,
-        default=ROOT.parent / "braincell",
+        default=ROOT / "assets/braincell",
     )
     parser.add_argument("--max-glomeruli", type=int, default=4)
     parser.add_argument("--max-granules", type=int, default=16)

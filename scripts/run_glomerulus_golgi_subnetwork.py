@@ -25,7 +25,7 @@ def main() -> None:
         type=Path,
         default=ROOT / "data/reference/balanced.hdf5",
     )
-    parser.add_argument("--braincell-repo", type=Path, default=ROOT.parent / "braincell")
+    parser.add_argument("--braincell-repo", type=Path, default=ROOT / "assets/braincell")
     parser.add_argument("--max-glomeruli", type=int, default=4)
     parser.add_argument("--max-golgi", type=int, default=4)
     parser.add_argument("--spike-times-ms", type=float, nargs="+", default=[1.0])

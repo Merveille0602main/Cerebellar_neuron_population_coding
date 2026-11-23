@@ -23,10 +23,9 @@ from examples.neuron_compare.cell._nrnmech import nrnmech_path
 CELL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CELL_DIR.parents[3]
 
-SOURCE_GRC_DIR = Path("/home/swl/Cerebellum_circuit/GrC/GrC")
-SOURCE_MORPH_PATH = SOURCE_GRC_DIR / "GrC2020.asc"
-
 DEFAULT_MORPH_PATH = REPO_ROOT / "examples" / "neuron_compare" / "Cerebellum_mod" / "GrC" / "morphology" / "GrC.asc"
+SOURCE_GRC_DIR = DEFAULT_MORPH_PATH.parent
+SOURCE_MORPH_PATH = DEFAULT_MORPH_PATH
 
 DEFAULT_NRNMECH_BUILD_DIR = REPO_ROOT / "examples" / "neuron_compare" / "Cerebellum_mod" / "GrC" / "x86_64"
 DEFAULT_NRNMECH_PATH = nrnmech_path(DEFAULT_NRNMECH_BUILD_DIR)

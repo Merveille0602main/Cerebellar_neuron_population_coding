@@ -73,8 +73,7 @@ off-by-one 行为悄悄“修正”掉。
 运行命令：
 
 ```bash
-PYTHONPATH=/home/merveille/copneuron/braincell:src \
-  .venv/bin/python -m pytest tests/test_paper_granule_cell.py -q
+.venv/bin/python -m pytest tests/test_paper_granule_cell.py -q
 ```
 
 ## 5. 尚未宣称等价的部分

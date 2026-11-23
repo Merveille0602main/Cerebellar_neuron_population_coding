@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import h5py
@@ -12,11 +13,12 @@ from cerebellar_reproduction.morphology_mapping import (
 )
 
 
-SOURCE = Path(__file__).parents[1] / "data/reference/balanced.hdf5"
-BRAINCELL = Path("/home/merveille/copneuron/braincell")
+ROOT = Path(__file__).parents[1]
+SOURCE = ROOT / "data/reference/balanced.hdf5"
+BRAINCELL = Path(os.environ.get("BRAINCELL_VALIDATION_ASSETS", ROOT / "assets/braincell"))
+MORPHOLOGIES = BRAINCELL / "examples/neuron_compare/Cerebellum_mod"
 
 
-@pytest.mark.skipif(not SOURCE.exists() or not BRAINCELL.exists(), reason="published integration data unavailable")
 def test_all_published_postsynaptic_compartments_are_mappable():
     from braincell import Morphology
 
@@ -27,9 +29,11 @@ def test_all_published_postsynaptic_compartments_are_mappable():
         "stellate_cell": ("StellateCell", "SC/morphology/SC.asc"),
         "basket_cell": ("BasketCell", "BC/morphology/BC.asc"),
     }
+    if not SOURCE.is_file() or any(not (MORPHOLOGIES / relative).is_file() for _, relative in cases.values()):
+        pytest.skip("requires the published data and full BrainCell morphology validation assets")
     mappings = {}
     for population, (name, relative) in cases.items():
-        morphology = Morphology.from_asc(BRAINCELL / "examples/neuron_compare/Cerebellum_mod" / relative)
+        morphology = Morphology.from_asc(MORPHOLOGIES / relative)
         mappings[population] = build_morphology_mapping(SOURCE, name, morphology)
 
     population_by_connection = {
@@ -58,13 +62,12 @@ def test_all_published_postsynaptic_compartments_are_mappable():
 
 
 def test_granule_target_mapping_distinguishes_terminal_and_preterminal():
-    if not SOURCE.exists() or not BRAINCELL.exists():
+    path = MORPHOLOGIES / "GrC/morphology/GrC.asc"
+    if not SOURCE.is_file() or not path.is_file():
         pytest.skip("published integration data unavailable")
     from braincell import Morphology
 
-    morphology = Morphology.from_asc(
-        BRAINCELL / "examples/neuron_compare/Cerebellum_mod/GrC/morphology/GrC.asc"
-    )
+    morphology = Morphology.from_asc(path)
     mapping = build_morphology_mapping(SOURCE, "GranuleCell", morphology)
     terminal = mapping.location(121)
     preterminal = mapping.location(120)

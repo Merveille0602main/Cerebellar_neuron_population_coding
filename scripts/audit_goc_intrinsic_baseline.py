@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Compare paper GoC intrinsic baselines mechanism-by-mechanism.
 
-Run this with the existing ``braincell`` Conda environment.  It contains the
-NEURON 8.2 runtime for which the checked-in GoC MOD libraries were compiled.
-The current BrainCell source is selected through ``PYTHONPATH`` in the command
-documented in ``GOC_INTRINSIC_BASELINE.md``.
+Use the reproduction environment and pass the GoC debug reference assets
+and matching compiled NEURON libraries with ``--braincell-repo``.
 """
 
 from __future__ import annotations
@@ -13,6 +11,7 @@ import argparse
 from dataclasses import fields
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 import brainstate
@@ -22,23 +21,7 @@ from braincell import mech
 from braincell.filter import at
 from neuron import h
 
-from examples.neuron_compare.cell.goc_ma2020.debug.goc_braincell_debug import (
-    GoC as BrainCellGoC,
-)
-from examples.neuron_compare.cell.goc_ma2020.debug.goc_neuron_debug import (
-    GoC as NeuronGoC,
-)
-from examples.neuron_compare.cell.goc_ma2020.debug.goc_parameters import (
-    GoCConfig,
-    GoCToggles,
-    load_goc20_params,
-)
-
-
 ROOT = Path(__file__).parents[1]
-BRAINCELL_ROOT = Path("/home/merveille/copneuron/braincell")
-GOC_ROOT = BRAINCELL_ROOT / "examples/neuron_compare/Cerebellum_mod/GoC"
-PARAMETER_PATH = BRAINCELL_ROOT / "examples/neuron_compare/cell/goc_ma2020/Optimization_result.txt"
 DEFAULT_OUTPUT = ROOT / "data/export/balanced/benchmarks/goc_intrinsic_baseline.json"
 
 
@@ -48,6 +31,7 @@ def main() -> None:
     parser.add_argument("--dt-ms", type=float, default=0.05)
     parser.add_argument("--temperature-c", type=float, default=34.0)
     parser.add_argument("--v-init-mv", type=float, default=-65.0)
+    parser.add_argument("--braincell-repo", type=Path, required=True, help="GoC debug reference assets")
     parser.add_argument(
         "--cases",
         help="Comma-separated case names; defaults to every single-mechanism case plus all.",
@@ -55,29 +39,36 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
 
+    assets = args.braincell_repo.resolve()
+    sys.path.append(str(assets))
+    from examples.neuron_compare.cell.goc_ma2020.debug.goc_braincell_debug import GoC as BrainCellGoC
+    from examples.neuron_compare.cell.goc_ma2020.debug.goc_neuron_debug import GoC as NeuronGoC
+    from examples.neuron_compare.cell.goc_ma2020.debug.goc_parameters import (
+        GoCConfig, GoCToggles, load_goc20_params,
+    )
+
     brainstate.environ.set(precision=64)
-    _load_neuron_libraries()
-    parameter = load_goc20_params(PARAMETER_PATH)
+    _load_neuron_libraries(assets / "examples/neuron_compare/Cerebellum_mod/GoC")
+    parameter = load_goc20_params(assets / "examples/neuron_compare/cell/goc_ma2020/Optimization_result.txt")
     selected = None if args.cases is None else frozenset(args.cases.split(","))
     reports = []
     for case_name, enabled in _cases():
         if selected is not None and case_name not in selected:
             continue
-        toggles = _toggles(enabled)
+        toggles = GoCToggles(**{field.name: field.name in enabled for field in fields(GoCToggles)})
         config = GoCConfig(
             toggles=toggles,
             temperature_celsius=args.temperature_c,
             v_init_mV=args.v_init_mv,
         )
         neuron_trace = _run_neuron(
-            parameter,
+            NeuronGoC(params=parameter, config=config, nrnmech_path=None).build(),
             config,
             dt_ms=args.dt_ms,
             duration_ms=args.duration_ms,
         )
         braincell_trace = _run_braincell(
-            parameter,
-            config,
+            BrainCellGoC(params=parameter, config=config, frozen=True).build(),
             dt_ms=args.dt_ms,
             duration_ms=args.duration_ms,
         )
@@ -132,21 +123,15 @@ def _cases() -> tuple[tuple[str, frozenset[str]], ...]:
     )
 
 
-def _toggles(enabled: frozenset[str]) -> GoCToggles:
-    values = {field.name: field.name in enabled for field in fields(GoCToggles)}
-    return GoCToggles(**values)
-
-
-def _load_neuron_libraries() -> None:
+def _load_neuron_libraries(goc_root: Path) -> None:
     for component in ("channel", "ion"):
-        library = GOC_ROOT / component / "x86_64/libnrnmech.so"
+        library = goc_root / component / "x86_64/libnrnmech.so"
         if not library.exists():
             raise FileNotFoundError(f"Missing GoC NEURON mechanism library: {library}")
         h.nrn_load_dll(str(library))
 
 
-def _run_neuron(parameter: Any, config: GoCConfig, *, dt_ms: float, duration_ms: float) -> np.ndarray:
-    model = NeuronGoC(params=parameter, config=config, nrnmech_path=None).build()
+def _run_neuron(model, config, *, dt_ms: float, duration_ms: float) -> np.ndarray:
     try:
         voltage = h.Vector().record(model.root_soma(0.5)._ref_v)
         h.cvode_active(0)
@@ -161,8 +146,7 @@ def _run_neuron(parameter: Any, config: GoCConfig, *, dt_ms: float, duration_ms:
         model.cleanup()
 
 
-def _run_braincell(parameter: Any, config: GoCConfig, *, dt_ms: float, duration_ms: float) -> np.ndarray:
-    model = BrainCellGoC(params=parameter, config=config, frozen=True).build()
+def _run_braincell(model, *, dt_ms: float, duration_ms: float) -> np.ndarray:
     model.cell.place(at("soma", 0.5), mech.StateProbe(name="v_soma"))
     model.cell.init_state()
     model.cell.reset_state()

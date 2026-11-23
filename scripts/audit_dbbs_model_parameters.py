@@ -109,7 +109,7 @@ def _paper_grc_channel_values(section_types) -> np.ndarray:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--braincell-repo", type=Path, default=ROOT.parent / "braincell")
+    parser.add_argument("--braincell-repo", type=Path, default=ROOT / "assets/braincell")
     parser.add_argument(
         "--reference-dir",
         type=Path,

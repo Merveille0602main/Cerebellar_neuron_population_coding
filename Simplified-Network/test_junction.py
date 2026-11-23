@@ -7,7 +7,6 @@ import brainunit as u
 import numpy as np
 from braincell.filter import at
 
-from explicit_junction import ExplicitJunction, RECORDING
 from junction import reciprocal_contacts
 
 
@@ -20,7 +19,10 @@ class JunctionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reciprocally mirrored"):
             reciprocal_contacts(cells[1:], compartments[1:])
 
+    @unittest.skipUnless(bc.__version__ == "0.2.0", "requires the archived BrainCell 0.2.0 runtime")
     def test_network_delivers_equal_and_opposite_current(self):
+        from explicit_junction import ExplicitJunction, RECORDING
+
         soma = bc.Branch.from_lengths(lengths=[20] * u.um, radii=[8, 8] * u.um, type="soma")
         cell = bc.Cell(bc.Morphology.from_root(soma, name="soma"), pop_size=(2,), V_init=-65.0 * u.mV)
         junction = ExplicitJunction(

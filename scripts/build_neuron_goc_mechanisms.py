@@ -25,7 +25,7 @@ def _sha256(path: Path) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--braincell-repo", type=Path, default=ROOT.parent / "braincell")
+    parser.add_argument("--braincell-repo", type=Path, default=ROOT / "assets/braincell")
     parser.add_argument(
         "--output",
         type=Path,

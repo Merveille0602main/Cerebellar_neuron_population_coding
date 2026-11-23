@@ -20,7 +20,7 @@ from cerebellar_reproduction import (
 
 
 ROOT = Path(__file__).parents[1]
-DEFAULT_CONFIG = ROOT.parent / "deschepper-etal-2022-source/configs/balanced.json"
+DEFAULT_CONFIG = ROOT / "data/reference/balanced.json"
 
 
 def main() -> None:
@@ -32,7 +32,7 @@ def main() -> None:
         type=Path,
         default=ROOT / "data/reference/balanced.hdf5",
     )
-    parser.add_argument("--braincell-repo", type=Path, default=ROOT.parent / "braincell")
+    parser.add_argument("--braincell-repo", type=Path, default=ROOT / "assets/braincell")
     parser.add_argument("--devices", nargs="+", default=["initial_mf", "background"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-glomeruli", type=int, default=8)

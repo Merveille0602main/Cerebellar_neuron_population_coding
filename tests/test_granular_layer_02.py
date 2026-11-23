@@ -1,12 +1,12 @@
-"""Regression tests for the published granular-layer circuit on BrainCell 0.2."""
+"""Regression tests for the published granular-layer circuit."""
 
 from pathlib import Path
 
 import pytest
 
 bc = pytest.importorskip("braincell")
-if bc.__version__ != "0.2.0":
-    pytest.skip("requires the official BrainCell 0.2.0 runtime", allow_module_level=True)
+if bc.__version__ != "0.2.0" and "+reproduction." not in bc.__version__:
+    pytest.skip("requires a supported BrainCell runtime", allow_module_level=True)
 
 import brainunit as u
 import numpy as np
@@ -19,8 +19,6 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = ROOT / "data/export/balanced"
 REFERENCE = ROOT / "data/reference/balanced.hdf5"
 ASSETS = ROOT / "assets/braincell"
-if not ASSETS.is_dir():
-    ASSETS = ROOT.parent / "braincell"
 
 pytestmark = pytest.mark.skipif(
     not REFERENCE.is_file() or not SPEC.is_dir() or not ASSETS.is_dir(),

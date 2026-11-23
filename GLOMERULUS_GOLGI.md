@@ -154,9 +154,7 @@ build_glomerulus_golgi_subnetwork(
 聚焦测试命令：
 
 ```bash
-cd /home/merveille/copneuron/braincell-cerebellar-reproduction
-PYTHONPATH=src:/home/merveille/copneuron/braincell \
-  .venv/bin/pytest -q tests/test_paper_synapses.py tests/test_runnable_subnetwork.py
+.venv/bin/pytest -q tests/test_paper_synapses.py tests/test_runnable_subnetwork.py
 ```
 
 当前结果：7 个测试通过。
@@ -165,10 +163,9 @@ PYTHONPATH=src:/home/merveille/copneuron/braincell \
 
 ### 8.1 可复现环境和输入
 
-NEURON 只作为本复现项目的独立参考求解器安装在 `.venv` 中，没有加入共享 BrainCell 的依赖。可选依赖固定为 `neuron==9.0.1`：
+NEURON 作为独立参考求解器安装在项目环境中。下文历史结果使用 9.0.1，当前 [NEURON 对照环境](ENVIRONMENT.md#与-neuron-对照) 使用 9.0.2。
 
 ```bash
-cd /home/merveille/copneuron/braincell-cerebellar-reproduction
 .venv/bin/pip install -e '.[neuron-validation]'
 .venv/bin/python scripts/fetch_dbbs_gaba_reference.py
 .venv/bin/python scripts/build_neuron_goc_mechanisms.py
@@ -189,8 +186,7 @@ BrainCell location   = dendrite_129, x=0.299347724...
 
 ```bash
 .venv/bin/python scripts/run_neuron_goc_contact_reference.py
-PYTHONPATH=src:/home/merveille/copneuron/braincell \
-  .venv/bin/python scripts/run_braincell_goc_contact_reference.py
+.venv/bin/python scripts/run_braincell_goc_contact_reference.py
 .venv/bin/python scripts/compare_goc_contact_traces.py
 ```
 

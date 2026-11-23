@@ -1,0 +1,94 @@
+{
+  "connectivity": {
+    "ascending_axon_to_golgi": {
+      "file": "connectivity/ascending_axon_to_golgi.npz",
+      "n_contact": 37,
+      "n_edge": 37,
+      "post_population": "golgi_cell",
+      "pre_population": "granule_cell"
+    },
+    "gap_goc": {
+      "file": "connectivity/gap_goc.npz",
+      "n_contact": 74,
+      "n_edge": 16,
+      "post_population": "golgi_cell",
+      "pre_population": "golgi_cell"
+    },
+    "glomerulus_to_golgi": {
+      "file": "connectivity/glomerulus_to_golgi.npz",
+      "n_contact": 631,
+      "n_edge": 631,
+      "post_population": "golgi_cell",
+      "pre_population": "glomerulus"
+    },
+    "glomerulus_to_granule": {
+      "file": "connectivity/glomerulus_to_granule.npz",
+      "n_contact": 1024,
+      "n_edge": 1024,
+      "post_population": "granule_cell",
+      "pre_population": "glomerulus"
+    },
+    "golgi_to_golgi": {
+      "file": "connectivity/golgi_to_golgi.npz",
+      "n_contact": 3870,
+      "n_edge": 24,
+      "post_population": "golgi_cell",
+      "pre_population": "golgi_cell"
+    },
+    "golgi_to_granule": {
+      "file": "connectivity/golgi_to_granule.npz",
+      "n_contact": 170,
+      "n_edge": 114,
+      "post_population": "granule_cell",
+      "pre_population": "golgi_cell"
+    },
+    "mossy_to_glomerulus": {
+      "file": "connectivity/mossy_to_glomerulus.npz",
+      "n_contact": 2336,
+      "n_edge": 2336,
+      "post_population": "glomerulus",
+      "pre_population": "mossy_fibers"
+    },
+    "parallel_fiber_to_golgi": {
+      "file": "connectivity/parallel_fiber_to_golgi.npz",
+      "n_contact": 97,
+      "n_edge": 97,
+      "post_population": "golgi_cell",
+      "pre_population": "granule_cell"
+    }
+  },
+  "format": "braincell-cerebellar-network-spec",
+  "format_version": 1,
+  "populations": {
+    "glomerulus": {
+      "file": "populations/glomerulus.npz",
+      "n_cell": 2336
+    },
+    "golgi_cell": {
+      "file": "populations/golgi_cell.npz",
+      "n_cell": 12
+    },
+    "granule_cell": {
+      "file": "populations/granule_cell.npz",
+      "n_cell": 256
+    },
+    "mossy_fibers": {
+      "file": "populations/mossy_fibers.npz",
+      "n_cell": 117
+    }
+  },
+  "selection": {
+    "algorithm": "numpy.default_rng.choice_without_replacement_on_sorted_source_ids",
+    "sample_order": [
+      "granule_cell",
+      "golgi_cell"
+    ],
+    "sampled_population_sizes": {
+      "golgi_cell": 12,
+      "granule_cell": 256
+    },
+    "seed": 318
+  },
+  "source_md5": "f0e17f89718c05756eb07a5da77b5c4c",
+  "source_path": "https://doi.org/10.5281/zenodo.7230288"
+}
